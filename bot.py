@@ -367,22 +367,22 @@ class BotState:
     def is_admin(self, user_id: int) -> bool:
         return user_id == OWNER_ID or user_id in self.admins
 
-# ==================== موتور اسکن سریع هم‌زمان ====================
+# ==================== موتور اسکن سریع و کنترل‌شده ====================
 class FastScanner:
     def __init__(self, client: TelegramClient, db: Database, state: BotState):
         self.client = client
         self.db = db
         self.state = state
-        self.scan_delay = 4  # بازه زمانی ۴ ثانیه‌ای برای اسکن هم‌زمان بدون بن شدن
+        self.scan_delay = 10  # افزایش زمان حلقه برای جلوگیری از محدودیت تلگرام
 
     @staticmethod
     def generate_hash(text: str) -> str:
         return hashlib.md5(text.strip().encode('utf-8')).hexdigest()
 
     async def process_channel_configs(self, channel: str):
-        """اسکن ۱۰ پیام آخر یک کانال برای کانفیگ"""
+        """اسکن پیام‌های کانال برای کانفیگ با کنترل محدودیت نرخ"""
         try:
-            messages = await self.client.get_messages(channel, limit=10)
+            messages = await self.client.get_messages(channel, limit=5)
             for msg in reversed(messages):
                 if not msg.text:
                     continue
@@ -392,32 +392,31 @@ class FastScanner:
                     clean_config = config.strip()
                     cfg_hash = self.generate_hash(clean_config)
 
-                    # ۱. بررسی سریع در RAM
                     if cfg_hash in self.state.sent_config_hashes:
                         continue
 
-                    # ۲. بررسی در دیتابیس
                     if await self.db.is_config_sent(cfg_hash):
                         self.state.add_config_hash(cfg_hash)
                         continue
 
-                    # رزرو سریع در RAM
                     self.state.add_config_hash(cfg_hash)
 
-                    # ارسال به کانال مقصد
                     await self.client.send_message(CONFIG_TARGET_CHANNEL, clean_config)
                     logger.info(f"⚡ [CONFIG] کانفیگ جدید از {channel} دریافت و ارسال شد.")
 
-                    # ذخیره‌سازی در پس‌زمینه
                     asyncio.create_task(self.db.add_sent_config(clean_config, cfg_hash, channel))
+                    await asyncio.sleep(2)  # تاخیر جهت عدم مواجهه با FloodWait
 
+        except FloodWaitError as e:
+            logger.warning(f"⚠️ محدودیت تلگرام برای {channel}: باید {e.seconds} ثانیه صبر کنیم.")
+            await asyncio.sleep(e.seconds)
         except Exception as e:
             logger.error(f"خطا در اسکن کانفیگ {channel}: {e}")
 
     async def process_channel_proxies(self, channel: str):
-        """اسکن ۱۰ پیام آخر یک کانال برای پروکسی"""
+        """اسکن پیام‌های کانال برای پروکسی با کنترل محدودیت نرخ"""
         try:
-            messages = await self.client.get_messages(channel, limit=10)
+            messages = await self.client.get_messages(channel, limit=5)
             for msg in reversed(messages):
                 if not msg.text:
                     continue
@@ -440,26 +439,32 @@ class FastScanner:
                     logger.info(f"⚡ [PROXY] پروکسی جدید از {channel} دریافت و ارسال شد.")
 
                     asyncio.create_task(self.db.add_sent_proxy(clean_proxy, prx_hash, channel))
+                    await asyncio.sleep(2)  # تاخیر جهت عدم مواجهه با FloodWait
 
+        except FloodWaitError as e:
+            logger.warning(f"⚠️ محدودیت تلگرام برای {channel}: باید {e.seconds} ثانیه صبر کنیم.")
+            await asyncio.sleep(e.seconds)
         except Exception as e:
             logger.error(f"خطا در اسکن پروکسی {channel}: {e}")
 
     async def start_config_scanner_loop(self):
-        """حلقه اجرای هم‌زمان اسکن کانفیگ‌ها"""
+        """حلقه اسکن کانفیگ‌ها به‌صورت توالی جزیی برای تعادل بار"""
         while self.state.config_scanner_running:
             try:
-                tasks = [self.process_channel_configs(ch) for ch in SOURCE_CONFIG_CHANNELS]
-                await asyncio.gather(*tasks)
+                for ch in SOURCE_CONFIG_CHANNELS:
+                    await self.process_channel_configs(ch)
+                    await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"خطا در حلقه اصلی کانفیگ: {e}")
             await asyncio.sleep(self.scan_delay)
 
     async def start_proxy_scanner_loop(self):
-        """حلقه اجرای هم‌زمان اسکن پروکسی‌ها"""
+        """حلقه اسکن پروکسی‌ها به‌صورت توالی جزیی برای تعادل بار"""
         while self.state.proxy_scanner_running:
             try:
-                tasks = [self.process_channel_proxies(ch) for ch in SOURCE_PROXY_CHANNELS]
-                await asyncio.gather(*tasks)
+                for ch in SOURCE_PROXY_CHANNELS:
+                    await self.process_channel_proxies(ch)
+                    await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"خطا در حلقه اصلی پروکسی: {e}")
             await asyncio.sleep(self.scan_delay)
@@ -544,6 +549,10 @@ async def main():
     bot_app.add_handler(CommandHandler("start", start_command))
     bot_app.add_handler(CallbackQueryHandler(admin_successful_orders, pattern="^admin_successful_orders$"))
 
+    # راه‌اندازی اولیه و ضروری Application قبل از ساخت وب‌سرور
+    await bot_app.initialize()
+    await bot_app.start()
+
     # ۴. راه‌اندازی حلقه اسکنرهای هم‌زمان
     scanner = FastScanner(telethon_client, db_instance, state_instance)
     asyncio.create_task(scanner.start_config_scanner_loop())
@@ -555,10 +564,14 @@ async def main():
         app = web.Application()
 
         async def webhook_handler(request):
-            data = await request.json()
-            update = Update.de_json(data, bot_app.bot)
-            await bot_app.process_update(update)
-            return web.Response(text="OK")
+            try:
+                data = await request.json()
+                update = Update.de_json(data, bot_app.bot)
+                await bot_app.process_update(update)
+                return web.Response(text="OK")
+            except Exception as e:
+                logger.error(f"خطا در پردازش Webhook: {e}")
+                return web.Response(status=500)
 
         app.router.add_post('/webhook', webhook_handler)
         runner = web.AppRunner(app)
@@ -567,8 +580,6 @@ async def main():
         await site.start()
         logger.info(f"🌐 وب‌سرویس Webhook روی پورت {PORT} فعال شد.")
     else:
-        await bot_app.initialize()
-        await bot_app.start()
         await bot_app.updater.start_polling()
         logger.info("🤖 حالت Polling ربات فعال شد...")
 
