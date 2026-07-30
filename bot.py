@@ -628,7 +628,7 @@ class Database:
             duplicate = 0
             invalid = 0
             
-            # الگوی تشخیص کانفنیگ معتبر
+            # الگوی تشخیص کانفنیگ معتبر - پشتیبانی از ss://, vless://, vmess://, trojan://, hy2://, wireguard://
             valid_patterns = ['vless://', 'vmess://', 'trojan://', 'ss://', 'hy2://', 'wireguard://']
             
             for config in configs:
@@ -642,15 +642,17 @@ class Database:
                     invalid += 1
                     continue
                 
-                config_hash = str(abs(hash(config.split('#')[0])))
+                # حذف بخش # از انتها برای هش یکسان
+                clean_config = config.split('#')[0] if '#' in config else config
+                config_hash = str(abs(hash(clean_config)))
                 
-                # بررسی تکراری نبودن
+                # بررسی تکراری نبودن در config_queue
                 existing = await conn.fetchrow('SELECT id FROM config_queue WHERE config_hash = $1', config_hash)
                 if existing:
                     duplicate += 1
                     continue
                 
-                # بررسی اینکه قبلاً ارسال نشده
+                # بررسی اینکه قبلاً ارسال نشده در sent_configs
                 sent = await conn.fetchrow('SELECT id FROM sent_configs WHERE config_hash = $1', config_hash)
                 if sent:
                     duplicate += 1
@@ -945,9 +947,13 @@ class ChannelScanner:
         return False
     
     async def extract_configs_from_text(self, text: str) -> List[str]:
+        """استخراج کانفنیگ‌ها از متن با پشتیبانی از ss://, vless://, vmess:// و ..."""
         if not text:
             return []
-        return self.config_regex.findall(text)
+        
+        # الگوی کامل برای همه پروتکل‌ها
+        pattern = r'(vless://[^\s]+|vmess://[^\s]+|trojan://[^\s]+|ss://[^\s]+|hy2://[^\s]+|wireguard://[^\s]+)'
+        return re.findall(pattern, text)
     
     async def extract_configs_from_file(self, file_content: bytes) -> List[str]:
         try:
@@ -1492,7 +1498,7 @@ class ChannelScanner:
             configs = await self.extract_configs_from_text(text_content)
             
             if not configs:
-                await message.reply_text("❌ هیچ کانفنیگ معتبری در فایل پیدا نشد!")
+                await message.reply_text("❌ هیچ کانفنیگ معتبری در فایل پیدا نشد!\n\nپروتکل‌های پشتیبانی شده:\n• vless://\n• vmess://\n• trojan://\n• ss://\n• hy2://\n• wireguard://")
                 return
             
             # اضافه کردن به صف
@@ -1516,7 +1522,7 @@ class ChannelScanner:
             await message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
             
             # اگر اسکنر TXT روشن نیست، روشن کن
-            if not self.state.txt_scanner_running:
+            if not self.state.txt_scanner_running and result['added'] > 0:
                 self.state.txt_scanner_running = True
                 await self.db.set_scanner_state("txt_scanner", "True")
                 await message.reply_text("✅ اسکنر کانفنیگ TXT به طور خودکار فعال شد!")
@@ -2239,8 +2245,7 @@ class ScannerBot:
     
     async def txt_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        user_id = query.from_user.id
-        
+        user_id = query.from_user.id        
         if not self.state.is_admin(user_id):
             await query.answer("فقط ادمین‌ها دسترسی دارند!", show_alert=True)
             return
@@ -2295,7 +2300,9 @@ class ScannerBot:
             "• فقط فایل‌های TXT پشتیبانی می‌شوند\n"
             "• هر کانفنیگ باید در یک خط جداگانه باشد\n"
             "• کانفنیگ‌های تکراری شناسایی می‌شوند\n"
-            "• کانفنیگ‌های نامعتبر نادیده گرفته می‌شوند",
+            "• کانفنیگ‌های نامعتبر نادیده گرفته می‌شوند\n\n"
+            "🔹 پروتکل‌های پشتیبانی شده:\n"
+            "• vless://\n• vmess://\n• trojan://\n• ss://\n• hy2://\n• wireguard://",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_txt_scanner", style="danger")]
             ]),
