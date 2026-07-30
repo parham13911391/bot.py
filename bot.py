@@ -237,12 +237,26 @@ class Database:
                 )
             ''')
             
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS config_queue (
+                    id SERIAL PRIMARY KEY,
+                    config_text TEXT,
+                    config_hash TEXT UNIQUE,
+                    source_file TEXT,
+                    added_at TIMESTAMP DEFAULT NOW(),
+                    sent BOOLEAN DEFAULT FALSE,
+                    sent_at TIMESTAMP
+                )
+            ''')
+            
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_configs_user_id ON configs(user_id)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_reports_user_id ON reports(user_id)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_sent_configs_hash ON sent_configs(config_hash)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_sent_proxies_hash ON sent_proxies(proxy_hash)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_config_queue_hash ON config_queue(config_hash)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_config_queue_sent ON config_queue(sent)')
             
             await conn.execute('''
                 INSERT INTO stats (key, value) VALUES 
@@ -252,7 +266,9 @@ class Database:
                 ('total_configs_sent', 0),
                 ('total_proxies_sent', 0),
                 ('total_reports', 0),
-                ('total_referrals', 0)
+                ('total_referrals', 0),
+                ('total_txt_configs', 0),
+                ('remaining_txt_configs', 0)
                 ON CONFLICT (key) DO NOTHING
             ''')
             
@@ -595,7 +611,92 @@ class Database:
             active_users = await conn.fetchrow('SELECT COUNT(*) FROM users WHERE is_banned = FALSE')
             stats['active_users'] = active_users[0] if active_users else 0
             
+            # آمار کانفنیگ‌های TXT
+            total_txt = await conn.fetchrow('SELECT COUNT(*) FROM config_queue')
+            stats['total_txt_configs'] = total_txt[0] if total_txt else 0
+            
+            remaining_txt = await conn.fetchrow('SELECT COUNT(*) FROM config_queue WHERE sent = FALSE')
+            stats['remaining_txt_configs'] = remaining_txt[0] if remaining_txt else 0
+            
             return stats
+    
+    # ==================== متدهای صف کانفنیگ TXT ====================
+    async def add_configs_to_queue(self, configs: List[str], source_file: str = None) -> Dict:
+        """اضافه کردن لیست کانفنیگ‌ها به صف"""
+        async with self.pool.acquire() as conn:
+            added = 0
+            duplicate = 0
+            invalid = 0
+            
+            # الگوی تشخیص کانفنیگ معتبر
+            valid_patterns = ['vless://', 'vmess://', 'trojan://', 'ss://', 'hy2://', 'wireguard://']
+            
+            for config in configs:
+                config = config.strip()
+                if not config:
+                    continue
+                
+                # بررسی معتبر بودن
+                is_valid = any(config.startswith(p) for p in valid_patterns)
+                if not is_valid:
+                    invalid += 1
+                    continue
+                
+                config_hash = str(abs(hash(config.split('#')[0])))
+                
+                # بررسی تکراری نبودن
+                existing = await conn.fetchrow('SELECT id FROM config_queue WHERE config_hash = $1', config_hash)
+                if existing:
+                    duplicate += 1
+                    continue
+                
+                # بررسی اینکه قبلاً ارسال نشده
+                sent = await conn.fetchrow('SELECT id FROM sent_configs WHERE config_hash = $1', config_hash)
+                if sent:
+                    duplicate += 1
+                    continue
+                
+                await conn.execute(
+                    'INSERT INTO config_queue (config_text, config_hash, source_file) VALUES ($1, $2, $3)',
+                    config, config_hash, source_file
+                )
+                added += 1
+            
+            # آپدیت آمار
+            await conn.execute('UPDATE stats SET value = value + $1 WHERE key = $2', added, 'total_txt_configs')
+            await conn.execute('UPDATE stats SET value = value + $1 WHERE key = $2', added, 'remaining_txt_configs')
+            
+            return {
+                'added': added,
+                'duplicate': duplicate,
+                'invalid': invalid,
+                'total': len(configs)
+            }
+    
+    async def get_next_config_from_queue(self) -> Optional[str]:
+        """دریافت یک کانفنیگ از صف برای ارسال"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT id, config_text FROM config_queue WHERE sent = FALSE ORDER BY id LIMIT 1'
+            )
+            if row:
+                await conn.execute(
+                    'UPDATE config_queue SET sent = TRUE, sent_at = NOW() WHERE id = $1',
+                    row['id']
+                )
+                await conn.execute('UPDATE stats SET value = value - 1 WHERE key = $1', 'remaining_txt_configs')
+                return row['config_text']
+            return None
+    
+    async def get_queue_stats(self) -> Dict:
+        """دریافت آمار صف"""
+        async with self.pool.acquire() as conn:
+            total = await conn.fetchrow('SELECT COUNT(*) FROM config_queue')
+            remaining = await conn.fetchrow('SELECT COUNT(*) FROM config_queue WHERE sent = FALSE')
+            return {
+                'total': total[0] if total else 0,
+                'remaining': remaining[0] if remaining else 0
+            }
 
 # ==================== لینک چنل‌ها ====================
 CHANNEL_1_LINK = "https://t.me/v2reya88"
@@ -612,7 +713,7 @@ GROUP_ID = -1001796213998
 CONFIG_TOPIC_ID = 108538
 PROXY_TOPIC_ID = 108613
 
-# ==================== لیست چنل‌های منبع (فقط ۲ چنل) ====================
+# ==================== لیست چنل‌های منبع ====================
 SOURCE_CONFIG_CHANNELS = [
     "@FarazV2ray",
     "@ConfigsHUB"
@@ -672,6 +773,7 @@ PLAN_DETAILS = {
 class BotState:
     config_scanner_running: bool = False
     proxy_scanner_running: bool = False
+    txt_scanner_running: bool = False
     config_log_enabled: bool = False
     proxy_log_enabled: bool = False
     send_to_topic_enabled: bool = True
@@ -731,7 +833,6 @@ class BotState:
         return user_id in self.banned_users
     
     def get_next_batch(self) -> List[str]:
-        # برای ۲ چنل، هر دو رو با هم برمی‌گردونه
         return SOURCE_CONFIG_CHANNELS
 
 # ==================== کلاس مدیریت هوش مصنوعی ====================
@@ -817,6 +918,8 @@ class ChannelScanner:
         self.config_regex = re.compile(r"(vless://\S+|vmess://\S+|trojan://\S+|ss://\S+|hy2://\S+|wireguard://\S+)")
         self._flood_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(2)
+        self._txt_sending = False
+        self._txt_task = None
     
     async def check_flood_wait(self) -> Tuple[bool, int]:
         async with self._flood_lock:
@@ -1250,11 +1353,53 @@ class ChannelScanner:
         except Exception as e:
             logger.error(f"Send log error: {e}")
     
+    async def process_txt_configs(self):
+        """پردازش و ارسال کانفنیگ‌های صف TXT"""
+        if self._txt_sending:
+            return
+        
+        self._txt_sending = True
+        logger.info("📂 Starting TXT configs sender...")
+        
+        try:
+            while self.state.txt_scanner_running:
+                # دریافت یک کانفنیگ از صف
+                config_text = await self.db.get_next_config_from_queue()
+                
+                if not config_text:
+                    # صف خالی است، اسکنر TXT را متوقف کن
+                    logger.info("📂 No more TXT configs in queue. Stopping TXT scanner...")
+                    self.state.txt_scanner_running = False
+                    await self.db.set_scanner_state("txt_scanner", "False")
+                    break
+                
+                # ارسال کانفنیگ
+                logger.info(f"📤 Sending TXT config...")
+                success = await self.send_config(config_text, "TXT_File")
+                
+                if success:
+                    # بعد از هر ارسال موفق، ۶۰ ثانیه صبر کن
+                    await asyncio.sleep(60)
+                else:
+                    # اگر خطا بود، ۵ ثانیه صبر کن
+                    await asyncio.sleep(5)
+                
+                # بروزرسانی آمار در پنل اسکنر
+                stats = await self.db.get_queue_stats()
+                logger.info(f"📊 Remaining TXT configs: {stats.get('remaining', 0)}")
+                
+        except Exception as e:
+            logger.error(f"❌ TXT sender error: {e}")
+        finally:
+            self._txt_sending = False
+            logger.info("📂 TXT configs sender stopped.")
+    
     async def scanner_loop(self):
         logger.info("🔄 Scanner loop started (Every 3 seconds)...")
         
         while True:
             try:
+                # ====== اسکنر کانفنیگ از چنل‌ها ======
                 if self.state.config_scanner_running:
                     for channel in SOURCE_CONFIG_CHANNELS:
                         if not self.state.config_scanner_running:
@@ -1275,12 +1420,11 @@ class ChannelScanner:
                                 else:
                                     await asyncio.sleep(1)
                         
-                        # هر ۳ ثانیه یک بار چک کن
                         await asyncio.sleep(3)
                     
-                    # بعد از بررسی هر دو چنل، یه مکث کوتاه
                     await asyncio.sleep(1)
                 
+                # ====== اسکنر پروکسی ======
                 if self.state.proxy_scanner_running:
                     for channel in SOURCE_PROXY_CHANNELS:
                         if not self.state.proxy_scanner_running:
@@ -1303,12 +1447,83 @@ class ChannelScanner:
                         
                         await asyncio.sleep(3)
                 
-                if not self.state.config_scanner_running and not self.state.proxy_scanner_running:
+                # ====== اسکنر TXT (کانفنیگ‌های فایل) ======
+                if self.state.txt_scanner_running:
+                    if not self._txt_sending:
+                        asyncio.create_task(self.process_txt_configs())
+                
+                if not self.state.config_scanner_running and not self.state.proxy_scanner_running and not self.state.txt_scanner_running:
                     await asyncio.sleep(5)
                     
             except Exception as e:
                 logger.error(f"Scanner loop error: {e}")
                 await asyncio.sleep(5)
+    
+    # ==================== مدیریت فایل TXT ====================
+    async def handle_txt_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دریافت و پردازش فایل TXT کانفنیگ"""
+        user_id = update.effective_user.id
+        message = update.message
+        
+        if not self.state.is_admin(user_id):
+            await message.reply_text("❌ فقط ادمین‌ها می‌توانند فایل ارسال کنند!")
+            return
+        
+        if not message.document:
+            await message.reply_text("❌ لطفاً یک فایل TXT ارسال کنید.")
+            return
+        
+        document = message.document
+        file_name = document.file_name or "unknown.txt"
+        
+        if not file_name.lower().endswith('.txt'):
+            await message.reply_text("❌ لطفاً فقط فایل TXT ارسال کنید.")
+            return
+        
+        await message.reply_text("🔄 در حال پردازش فایل... لطفاً صبر کنید.")
+        
+        try:
+            # دانلود فایل
+            file = await self.bot_app.bot.get_file(document.file_id)
+            file_content = await file.download_as_bytearray()
+            text_content = file_content.decode('utf-8', errors='ignore')
+            
+            # استخراج کانفنیگ‌ها
+            configs = await self.extract_configs_from_text(text_content)
+            
+            if not configs:
+                await message.reply_text("❌ هیچ کانفنیگ معتبری در فایل پیدا نشد!")
+                return
+            
+            # اضافه کردن به صف
+            result = await self.db.add_configs_to_queue(configs, file_name)
+            
+            # گزارش نتیجه
+            report_text = f"""📊 **نتیجه پردازش فایل `{file_name}`**
+
+✅ کانفنیگ‌های معتبر جدید: {result['added']}
+🔄 کانفنیگ‌های تکراری: {result['duplicate']}
+❌ کانفنیگ‌های نامعتبر: {result['invalid']}
+📦 کل کانفنیگ‌های موجود در فایل: {result['total']}
+
+📂 **آمار صف کانفنیگ TXT:**
+└ کل کانفنیگ‌ها: {result['added']}
+└ باقی‌مانده برای ارسال: {result['added']}
+
+⏳ هر ۶۰ ثانیه یک کانفنیگ ارسال می‌شود.
+"""
+            
+            await message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
+            
+            # اگر اسکنر TXT روشن نیست، روشن کن
+            if not self.state.txt_scanner_running:
+                self.state.txt_scanner_running = True
+                await self.db.set_scanner_state("txt_scanner", "True")
+                await message.reply_text("✅ اسکنر کانفنیگ TXT به طور خودکار فعال شد!")
+            
+        except Exception as e:
+            logger.error(f"Error processing TXT file: {e}")
+            await message.reply_text(f"❌ خطا در پردازش فایل: {e}")
 
 # ==================== کلاس مدیریت ربات ====================
 class ScannerBot:
@@ -1461,16 +1676,16 @@ class ScannerBot:
             [
                 InlineKeyboardButton("اسکنر کانفنیگ", callback_data="admin_config_scanner", style="primary"),
                 InlineKeyboardButton("اسکنر پروکسی", callback_data="admin_proxy_scanner", style="primary"),
-                InlineKeyboardButton("ارسال به تاپیک", callback_data="admin_topic", style="primary")
+                InlineKeyboardButton("کانفنیگ TXT", callback_data="admin_txt_scanner", style="success")
             ],
             [
                 InlineKeyboardButton("📊 آمار کامل", callback_data="admin_stats_full", style="success"),
                 InlineKeyboardButton("ساخت ردیم کد", callback_data="admin_gen_redeem", style="success"),
-                InlineKeyboardButton("ارسال همگانی", callback_data="admin_broadcast", style="success")
+                InlineKeyboardButton("ارسال همگانی", callback_data="admin_broadcast", style="danger")
             ],
             [
                 InlineKeyboardButton("مدیریت سفارشات", callback_data="admin_orders", style="primary"),
-                InlineKeyboardButton("افزودن ادمین", callback_data="admin_add_admin", style="danger"),
+                InlineKeyboardButton("افزودن ادمین", callback_data="admin_add_admin", style="success"),
                 InlineKeyboardButton("حذف ادمین", callback_data="admin_remove_admin", style="danger")
             ],
             [
@@ -1480,12 +1695,13 @@ class ScannerBot:
             ],
             [
                 InlineKeyboardButton("لیست خریدهای موفق", callback_data="admin_successful_orders", style="success"),
-                InlineKeyboardButton("لیست گزارشات", callback_data="admin_report_list", style="success")
+                InlineKeyboardButton("لیست گزارشات", callback_data="admin_report_list", style="success"),
+                InlineKeyboardButton("ارسال به تاپیک", callback_data="admin_topic", style="primary")
             ],
             [
                 InlineKeyboardButton("درخواست‌های ردیم کد", callback_data="admin_redeem_requests", style="primary"),
                 InlineKeyboardButton("پاسخ مجدد به گزارش", callback_data="admin_reply_again", style="primary"),
-                InlineKeyboardButton("بازگشت", callback_data="back_main", style="primary")
+                InlineKeyboardButton("بازگشت", callback_data="back_main", style="danger")
             ]
         ])
     
@@ -1510,6 +1726,21 @@ class ScannerBot:
                 InlineKeyboardButton("خاموش", callback_data="topic_off", style="danger")
             ],
             [InlineKeyboardButton("بازگشت", callback_data="back_to_admin", style="primary")]
+        ])
+    
+    def txt_scanner_buttons(self):
+        status = "🟢 در حال اجرا" if self.state.txt_scanner_running else "🔴 متوقف"
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("▶️ استارت", callback_data="txt_start", style="success"),
+                InlineKeyboardButton("⏹ توقف", callback_data="txt_stop", style="danger")
+            ],
+            [
+                InlineKeyboardButton("📤 ارسال فایل TXT", callback_data="txt_upload", style="primary")
+            ],
+            [
+                InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="primary")
+            ]
         ])
     
     def main_menu_buttons(self, user_id: int):
@@ -1712,6 +1943,22 @@ class ScannerBot:
 لطفاً منتظر باشید...
 """
 
+    TXT_SCANNER_TEXT = """
+📂 **مدیریت کانفنیگ TXT**
+
+از این بخش می‌توانید فایل TXT حاوی کانفنیگ‌ها را آپلود کنید.
+ربات به طور خودکار کانفنیگ‌ها را استخراج کرده و هر ۶۰ ثانیه یک عدد از آنها را ارسال می‌کند.
+
+📌 **نکات:**
+• فقط فایل‌های TXT پشتیبانی می‌شوند
+• کانفنیگ‌های تکراری شناسایی و حذف می‌شوند
+• کانفنیگ‌های نامعتبر نادیده گرفته می‌شوند
+• پس از اتمام کانفنیگ‌ها، اسکنر به حالت تعلیق در می‌آید
+
+📊 **آمار فعلی:**
+{stats}
+"""
+
     # ==================== وب پنل ====================
     async def web_admin_panel(self, request):
         try:
@@ -1747,6 +1994,7 @@ class ScannerBot:
                     .badge-success {{ background: #d4edda; color: #155724; }}
                     .badge-danger {{ background: #f8d7da; color: #721c24; }}
                     .badge-warning {{ background: #fff3cd; color: #856404; }}
+                    .badge-info {{ background: #d1ecf1; color: #0c5460; }}
                     .refresh-btn {{ position: fixed; bottom: 30px; right: 30px; background: rgba(255,255,255,0.95); border: none; border-radius: 50px; padding: 12px 20px; box-shadow: 0 5px 20px rgba(0,0,0,0.2); cursor: pointer; font-size: 0.9em; font-weight: bold; color: #667eea; transition: all 0.3s; z-index: 1000; }}
                     .refresh-btn:hover {{ transform: scale(1.05); background: #667eea; color: white; }}
                     @media (max-width: 768px) {{ .stats-grid {{ grid-template-columns: repeat(2, 1fr); }} table {{ font-size: 0.75em; }} }}
@@ -1770,6 +2018,8 @@ class ScannerBot:
                         <div class="stat-card"><div class="number">{stats.get('total_proxies_sent', 0)}</div><div class="label">🔄 پروکسی ارسال شده</div></div>
                         <div class="stat-card"><div class="number">{stats.get('total_reports', 0)}</div><div class="label">📝 گزارشات</div></div>
                         <div class="stat-card"><div class="number">{stats.get('total_referrals', 0)}</div><div class="label">🔗 رفرال‌ها</div></div>
+                        <div class="stat-card"><div class="number">{stats.get('total_txt_configs', 0)}</div><div class="label">📂 کانفنیگ TXT</div></div>
+                        <div class="stat-card"><div class="number">{stats.get('remaining_txt_configs', 0)}</div><div class="label">⏳ باقی‌مانده از TXT</div></div>
                     </div>
                     
                     <div class="section">
@@ -1874,6 +2124,10 @@ class ScannerBot:
 └ کانفنیگ ارسال شده به چنل: {stats.get('total_configs_sent', 0)}
 └ پروکسی ارسال شده به چنل: {stats.get('total_proxies_sent', 0)}
 
+📂 **کانفنیگ TXT**
+└ کل کانفنیگ‌های وارد شده: {stats.get('total_txt_configs', 0)}
+└ باقی‌مانده برای ارسال: {stats.get('remaining_txt_configs', 0)}
+
 📝 **گزارشات**
 └ کل گزارشات: {stats.get('total_reports', 0)}
 
@@ -1946,6 +2200,107 @@ class ScannerBot:
         self.state.send_to_topic_enabled = False
         await query.answer("🔴 ارسال به تاپیک خاموش شد!")
         await self.admin_topic_panel(update, context)
+    
+    # ==================== مدیریت کانفنیگ TXT ====================
+    async def admin_txt_scanner(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند!", show_alert=True)
+            return
+        
+        await query.answer()
+        
+        stats = await self.db.get_queue_stats()
+        status = "🟢 در حال اجرا" if self.state.txt_scanner_running else "🔴 متوقف"
+        
+        text = f"""📂 **مدیریت کانفنیگ TXT**
+
+وضعیت: {status}
+
+📊 **آمار صف:**
+└ کل کانفنیگ‌ها: {stats.get('total', 0)}
+└ باقی‌مانده برای ارسال: {stats.get('remaining', 0)}
+
+📌 **نکات:**
+• هر ۶۰ ثانیه یک کانفنیگ ارسال می‌شود
+• کانفنیگ‌های تکراری شناسایی می‌شوند
+• پس از اتمام صف، اسکنر متوقف می‌شود
+
+برای ارسال فایل TXT، روی دکمه «ارسال فایل TXT» کلیک کنید.
+"""
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=self.txt_scanner_buttons(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def txt_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند!", show_alert=True)
+            return
+        
+        stats = await self.db.get_queue_stats()
+        
+        if stats.get('remaining', 0) == 0:
+            await query.answer("❌ هیچ کانفنیگی در صف وجود ندارد! ابتدا فایل TXT ارسال کنید.", show_alert=True)
+            return
+        
+        if self.state.txt_scanner_running:
+            await query.answer("اسکنر TXT در حال اجراست!", show_alert=True)
+            return
+        
+        self.state.txt_scanner_running = True
+        await self.db.set_scanner_state("txt_scanner", "True")
+        await query.answer("✅ اسکنر کانفنیگ TXT شروع شد!", show_alert=True)
+        await self.admin_txt_scanner(update, context)
+    
+    async def txt_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند!", show_alert=True)
+            return
+        
+        if not self.state.txt_scanner_running:
+            await query.answer("اسکنر TXT در حال اجرا نیست!", show_alert=True)
+            return
+        
+        self.state.txt_scanner_running = False
+        await self.db.set_scanner_state("txt_scanner", "False")
+        await query.answer("⏹ اسکنر کانفنیگ TXT متوقف شد!", show_alert=True)
+        await self.admin_txt_scanner(update, context)
+    
+    async def txt_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند!", show_alert=True)
+            return
+        
+        await query.answer()
+        context.user_data['waiting_for_txt'] = True
+        
+        await query.edit_message_text(
+            "📤 **ارسال فایل TXT کانفنیگ**\n\n"
+            "لطفاً فایل TXT حاوی کانفنیگ‌ها را ارسال کنید.\n\n"
+            "📌 **نکات:**\n"
+            "• فقط فایل‌های TXT پشتیبانی می‌شوند\n"
+            "• هر کانفنیگ باید در یک خط جداگانه باشد\n"
+            "• کانفنیگ‌های تکراری شناسایی می‌شوند\n"
+            "• کانفنیگ‌های نامعتبر نادیده گرفته می‌شوند",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_txt_scanner", style="danger")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
     
     # ==================== مدیریت سفارشات ====================
     async def admin_orders_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2137,7 +2492,6 @@ class ScannerBot:
     
     # ==================== لیست خریدهای موفق ====================
     async def admin_successful_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """لیست همه خریدهای موفق با جزئیات"""
         query = update.callback_query
         user_id = query.from_user.id
         
@@ -2194,7 +2548,6 @@ class ScannerBot:
             )
     
     async def admin_export_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """خروجی گرفتن از همه خریدها"""
         query = update.callback_query
         user_id = query.from_user.id
         
@@ -2237,7 +2590,6 @@ class ScannerBot:
     
     # ==================== لیست گزارشات ====================
     async def admin_report_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """لیست همه گزارشات با وضعیت"""
         query = update.callback_query
         user_id = query.from_user.id
         
@@ -2309,7 +2661,6 @@ class ScannerBot:
             )
     
     async def admin_export_reports(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """خروجی گرفتن از همه گزارشات"""
         query = update.callback_query
         user_id = query.from_user.id
         
@@ -2351,7 +2702,6 @@ class ScannerBot:
             await query.edit_message_text(f"❌ خطا: {e}")
     
     async def admin_reply_again(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """پاسخ مجدد به یک گزارش (حتی اگر پاسخ داده شده باشد)"""
         query = update.callback_query
         admin_id = query.from_user.id
         
@@ -3971,6 +4321,12 @@ class ScannerBot:
             user.last_name if user.last_name else None
         )
         
+        # دریافت فایل TXT
+        if context.user_data.get('waiting_for_txt') and message.document:
+            await self.scanner.handle_txt_file(update, context)
+            context.user_data['waiting_for_txt'] = False
+            return
+        
         # دریافت رسید
         if context.user_data.get('waiting_for_receipt') and message.photo:
             await self.receive_receipt(update, context)
@@ -4157,6 +4513,20 @@ class ScannerBot:
             # ====== آمار ======
             if data == "admin_stats_full":
                 await self.admin_stats_full(update, context)
+                return
+            
+            # ====== TXT ======
+            if data == "admin_txt_scanner":
+                await self.admin_txt_scanner(update, context)
+                return
+            if data == "txt_start":
+                await self.txt_start(update, context)
+                return
+            if data == "txt_stop":
+                await self.txt_stop(update, context)
+                return
+            if data == "txt_upload":
+                await self.txt_upload(update, context)
                 return
             
             # ====== خرید ======
@@ -4450,11 +4820,15 @@ class ScannerBot:
             proxy_state = await self.db.get_scanner_state("proxy_scanner")
             self.state.proxy_scanner_running = proxy_state == "True"
             
-            logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running}, Proxy: {self.state.proxy_scanner_running}")
+            txt_state = await self.db.get_scanner_state("txt_scanner")
+            self.state.txt_scanner_running = txt_state == "True"
+            
+            logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running}, Proxy: {self.state.proxy_scanner_running}, TXT: {self.state.txt_scanner_running}")
         except Exception as e:
             logger.error(f"Error loading scanner states: {e}")
             self.state.config_scanner_running = False
             self.state.proxy_scanner_running = False
+            self.state.txt_scanner_running = False
         
         # اتصال به اکانت تلگرام
         if not USER_SESSION_STR:
