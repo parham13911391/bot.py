@@ -18,11 +18,25 @@ from dataclasses import dataclass, field
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import ChatAdminRequiredError, UserNotParticipantError, RPCError, FloodWaitError
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
+from telegram import InlineKeyboardButton as _BaseInlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
 from aiohttp import web
+
+# ==================== دکمه با پارامتر style (سازگاری) ====================
+# نکته مهم: تلگرام هیچ رنگی برای دکمه‌های inline پشتیبانی نمی‌کند (نه آبی،
+# نه قرمز، نه سبز) - این یک محدودیت خودِ پلتفرم تلگرامه، نه چیزی که با کد
+# بشه دورش زد. کتابخانه python-telegram-bot هم پارامتری به اسم style قبول
+# نمی‌کنه و پاس دادنش باعث TypeError می‌شد (همون "خطای الکی" که می‌دیدی -
+# کانفنیگ/لینک واقعاً ذخیره/پردازش می‌شد ولی ساخت دکمه‌ی جواب با کرش مواجه
+# می‌شد). این کلاس فقط style رو قبول و نادیده می‌گیره تا هم کد قبلی/جدید با
+# style="danger"/"success"/"primary" بدون کرش کار کنه، هم توی خود تلگرام
+# دکمه‌ها عادی (خاکستری) دیده بشن.
+class InlineKeyboardButton(_BaseInlineKeyboardButton):
+    def __init__(self, text, style=None, **kwargs):
+        super().__init__(text, **kwargs)
+
 
 # ==================== تنظیمات اصلی (جدید) ====================
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
@@ -42,6 +56,35 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+
+# ==================== ذخیره لاگ‌های اخیر برای دستور /logs ====================
+# همون خروجی‌ای که توی Railway (تب Logs) می‌بینی، از همین stdout ربات میاد؛
+# پس یه بافر حافظه‌ای نگه می‌داریم که دستور /logs از روش فیلتر کنه:
+# خطاها (ERROR/CRITICAL) + هر چیزی که مال ۱۰ دقیقه‌ی اخیره.
+class LogCapture(logging.Handler):
+    def __init__(self, maxlen: int = 3000):
+        super().__init__()
+        self.buffer = deque(maxlen=maxlen)
+
+    def emit(self, record):
+        try:
+            self.buffer.append((datetime.now(), record.levelno, self.format(record)))
+        except Exception:
+            pass
+
+    def get_recent(self, minutes: int = 10):
+        cutoff = datetime.now() - timedelta(minutes=minutes)
+        result = []
+        for ts, levelno, line in self.buffer:
+            if levelno >= logging.ERROR or ts >= cutoff:
+                result.append(line)
+        return result
+
+
+log_capture = LogCapture()
+log_capture.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
+logging.getLogger().addHandler(log_capture)
 
 # ==================== دیتابیس PostgreSQL ====================
 class Database:
@@ -863,7 +906,7 @@ class BotState:
     github_source_url: Optional[str] = None
     config_log_enabled: bool = False
     proxy_log_enabled: bool = False
-    send_to_topic_enabled: bool = True
+    send_to_topic_enabled: bool = False  # پیش‌فرض خاموش
     
     sent_config_hashes: Set[str] = field(default_factory=set)
     sent_proxy_hashes: Set[str] = field(default_factory=set)
@@ -898,6 +941,7 @@ class BotState:
     proxy_last_msg_id: Dict[str, int] = field(default_factory=dict)
     last_proxy_scan_time: datetime = field(default_factory=datetime.now)
     proxy_scan_retry_count: int = 0
+    last_topic_forward_ids: Dict[str, int] = field(default_factory=dict)  # برای فورارد هر ۱۰ ثانیه
     
     db: Optional[Database] = None
     
@@ -1023,6 +1067,9 @@ class ChannelScanner:
         
         @self.user_client.on(events.NewMessage(chats=CHANNEL_1_USERNAME))
         async def _live_forward_handler(event):
+            # اگه از پنل ادمین "ارسال به تاپیک" خاموش باشه، فورارد نمی‌کنیم
+            if not self.state.send_to_topic_enabled:
+                return
             try:
                 await self.user_client.forward_messages(
                     entity=GROUP_ID,
@@ -1030,11 +1077,48 @@ class ChannelScanner:
                     from_peer=event.chat_id,
                     top_msg_id=CONFIG_TOPIC_ID
                 )
+                self.state.last_topic_forward_ids[CHANNEL_1_USERNAME] = event.message.id
                 logger.info(f"✅ Live-forwarded message {event.message.id} from {CHANNEL_1_USERNAME} to topic {CONFIG_TOPIC_ID}")
             except Exception as e:
                 logger.error(f"Live forward error: {e}")
         
         logger.info(f"👂 Live forwarder registered: {CHANNEL_1_USERNAME} -> topic {CONFIG_TOPIC_ID}")
+
+    async def topic_forward_loop(self):
+        """هر ۱۰ ثانیه، جدیدترین پیام چنل ۱ (کانفنیگ) و چنل ۲ (پروکسی) رو
+        چک می‌کنه و اگه فرق داشت با پیامی که قبلاً فورارد شده، به تاپیک
+        مربوطه توی گروه فورارد می‌کنه. این یه لایه‌ی پشتیبان برای
+        live-forward هست، چون بعضی وقت‌ها event لحظه‌ای به هر دلیلی
+        (قطعی موقت، ری‌کانکت و ...) از دست می‌ره."""
+        logger.info("⏱️ Topic forward loop (هر ۱۰ ثانیه) شروع شد")
+        sources = [
+            (CHANNEL_1_USERNAME, CONFIG_TOPIC_ID),
+            (CHANNEL_2_USERNAME, PROXY_TOPIC_ID),
+        ]
+        while True:
+            try:
+                if self.state.send_to_topic_enabled:
+                    for channel_username, topic_id in sources:
+                        try:
+                            latest = await self.user_client.get_messages(channel_username, limit=1)
+                            if not latest:
+                                continue
+                            latest_msg = latest[0]
+                            last_id = self.state.last_topic_forward_ids.get(channel_username)
+                            if latest_msg.id != last_id:
+                                await self.user_client.forward_messages(
+                                    entity=GROUP_ID,
+                                    messages=latest_msg.id,
+                                    from_peer=channel_username,
+                                    top_msg_id=topic_id
+                                )
+                                self.state.last_topic_forward_ids[channel_username] = latest_msg.id
+                                logger.info(f"✅ (10s-loop) Forwarded {latest_msg.id} from {channel_username} to topic {topic_id}")
+                        except Exception as e:
+                            logger.error(f"Topic forward loop error ({channel_username}): {e}")
+            except Exception as e:
+                logger.error(f"Topic forward loop fatal error: {e}")
+            await asyncio.sleep(10)
     
     async def check_flood_wait(self) -> Tuple[bool, int]:
         async with self._flood_lock:
@@ -1358,7 +1442,7 @@ class ChannelScanner:
             
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("CHANNEL 1", url=CHANNEL_1_LINK, style="danger"),
+                    InlineKeyboardButton("CHANNEL 1", url=CHANNEL_1_LINK, style="primary"),
                     InlineKeyboardButton("CHANNEL 2", url=CHANNEL_2_LINK, style="danger")
                 ],
                 [
@@ -1773,7 +1857,7 @@ class ScannerBot:
     def membership_buttons(self):
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("چنل کانفنیگ", url=CHANNEL_1_LINK, style="danger"),
+                InlineKeyboardButton("چنل کانفنیگ", url=CHANNEL_1_LINK, style="primary"),
                 InlineKeyboardButton("چنل پروکسی", url=CHANNEL_2_LINK, style="danger")
             ],
             [
@@ -1866,32 +1950,45 @@ class ScannerBot:
             [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_buy", style="danger")]
         ])
     
-    def admin_panel_buttons(self):
+    def admin_panel_buttons(self, page: int = 1):
+        # صفحه ۱: کنترل‌های اصلی و پرکاربرد
+        if page == 1:
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("اسکنر کانفنیگ", callback_data="admin_config_scanner", style="danger"),
+                    InlineKeyboardButton("اسکنر پروکسی", callback_data="admin_proxy_scanner", style="danger"),
+                    InlineKeyboardButton("کانفنیگ TXT", callback_data="admin_txt_scanner", style="danger")
+                ],
+                [
+                    InlineKeyboardButton("📊 آمار کامل", callback_data="admin_stats_full", style="success"),
+                    InlineKeyboardButton("ساخت ردیم کد", callback_data="admin_gen_redeem", style="success"),
+                    InlineKeyboardButton("ارسال همگانی", callback_data="admin_broadcast", style="success")
+                ],
+                [
+                    InlineKeyboardButton("مدیریت سفارشات", callback_data="admin_orders", style="primary"),
+                    InlineKeyboardButton("افزودن ادمین", callback_data="admin_add_admin", style="primary"),
+                    InlineKeyboardButton("حذف ادمین", callback_data="admin_remove_admin", style="primary")
+                ],
+                [
+                    InlineKeyboardButton("لیست ادمین‌ها", callback_data="admin_list", style="danger"),
+                    InlineKeyboardButton("بن/آنبن", callback_data="admin_ban_menu", style="danger")
+                ],
+                [
+                    InlineKeyboardButton("➡️ بعدی", callback_data="admin_page_2", style="primary")
+                ],
+                [
+                    InlineKeyboardButton("بازگشت", callback_data="back_main", style="success")
+                ]
+            ])
+        # صفحه ۲: گزینه‌های تکمیلی (لاگ، فورارد به تاپیک، گیت‌هاب و ...)
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("اسکنر کانفنیگ", callback_data="admin_config_scanner", style="danger"),
-                InlineKeyboardButton("اسکنر پروکسی", callback_data="admin_proxy_scanner", style="danger"),
-                InlineKeyboardButton("کانفنیگ TXT", callback_data="admin_txt_scanner", style="danger")
-            ],
-            [
-                InlineKeyboardButton("📊 آمار کامل", callback_data="admin_stats_full", style="success"),
-                InlineKeyboardButton("ساخت ردیم کد", callback_data="admin_gen_redeem", style="success"),
-                InlineKeyboardButton("ارسال همگانی", callback_data="admin_broadcast", style="success")
-            ],
-            [
-                InlineKeyboardButton("مدیریت سفارشات", callback_data="admin_orders", style="primary"),
-                InlineKeyboardButton("افزودن ادمین", callback_data="admin_add_admin", style="primary"),
-                InlineKeyboardButton("حذف ادمین", callback_data="admin_remove_admin", style="primary")
-            ],
-            [
-                InlineKeyboardButton("لیست ادمین‌ها", callback_data="admin_list", style="danger"),
-                InlineKeyboardButton("بن/آنبن", callback_data="admin_ban_menu", style="danger"),
-                InlineKeyboardButton("لاگ‌ها", callback_data="admin_log_menu", style="danger")
+                InlineKeyboardButton("لاگ‌ها", callback_data="admin_log_menu", style="danger"),
+                InlineKeyboardButton("ارسال به تاپیک", callback_data="admin_topic", style="success")
             ],
             [
                 InlineKeyboardButton("لیست خریدهای موفق", callback_data="admin_successful_orders", style="success"),
-                InlineKeyboardButton("لیست گزارشات", callback_data="admin_report_list", style="success"),
-                InlineKeyboardButton("ارسال به تاپیک", callback_data="admin_topic", style="success")
+                InlineKeyboardButton("لیست گزارشات", callback_data="admin_report_list", style="success")
             ],
             [
                 InlineKeyboardButton("درخواست‌های ردیم کد", callback_data="admin_redeem_requests", style="primary"),
@@ -1899,6 +1996,9 @@ class ScannerBot:
             ],
             [
                 InlineKeyboardButton("GitHub", callback_data="admin_github", style="danger")
+            ],
+            [
+                InlineKeyboardButton("⬅️ قبلی", callback_data="admin_page_1", style="primary")
             ],
             [
                 InlineKeyboardButton("بازگشت", callback_data="back_main", style="success")
@@ -1961,7 +2061,7 @@ class ScannerBot:
         if self.state.is_admin(user_id):
             return InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("پنل ادمین", callback_data="admin_panel", style="danger"),
+                    InlineKeyboardButton("پنل ادمین", callback_data="admin_panel", style="primary"),
                     InlineKeyboardButton("پنل کاربری", callback_data="user_panel", style="danger")
                 ],
                 [
@@ -4052,16 +4152,17 @@ class ScannerBot:
             logger.error(f"   {traceback.format_exc()}")
             await update.message.reply_text("❌ خطا در اجرای دستور! لطفاً دوباره تلاش کنید.")
     
-    async def admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
         query = update.callback_query
         user_id = query.from_user.id
         if not self.state.is_admin(user_id):
             await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
             return
         await query.answer()
+        title = "📋 پنل مدیریت ربات" if page == 1 else "📋 پنل مدیریت ربات (صفحه ۲)"
         await query.edit_message_text(
-            "📋 پنل مدیریت ربات",
-            reply_markup=self.admin_panel_buttons(),
+            title,
+            reply_markup=self.admin_panel_buttons(page=page),
             parse_mode=ParseMode.MARKDOWN
         )
     
@@ -4476,13 +4577,43 @@ class ScannerBot:
         await query.answer()
         await query.edit_message_text(
             "📋 **مدیریت لاگ‌ها**\n\n"
-            "لاگ‌ها در Railway قابل مشاهده هستند.\n"
-            "برای مشاهده لاگ‌ها به پنل Railway بروید.",
+            "با دستور /logs یا دکمه‌ی زیر، آخرین لاگ‌های خطا و لاگ‌های ۱۰ "
+            "دقیقه‌ی اخیر ربات (همون چیزی که توی Railway هم می‌بینی) رو "
+            "همین‌جا دریافت کن.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📄 دریافت لاگ‌های اخیر", callback_data="admin_get_logs", style="primary")],
                 [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="danger")]
             ])
         )
+
+    async def send_recent_logs(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """لاگ‌های خطا + لاگ‌های ۵ تا ۱۰ دقیقه‌ی اخیر رو به صورت بلاک کد می‌فرسته."""
+        lines = log_capture.get_recent(minutes=10)
+        if not lines:
+            await context.bot.send_message(chat_id=chat_id, text="✅ هیچ لاگ خطا یا لاگ اخیری پیدا نشد.")
+            return
+
+        text = "\n".join(lines)
+        chunk_size = 3500
+        chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)] or [""]
+
+        for i, chunk in enumerate(chunks):
+            header = f"📋 لاگ‌های اخیر ({i + 1}/{len(chunks)}):\n" if len(chunks) > 1 else "📋 لاگ‌های اخیر:\n"
+            safe_chunk = html.escape(chunk)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{header}<pre>{safe_chunk}</pre>",
+                parse_mode=ParseMode.HTML
+            )
+
+    async def logs_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور /logs - فقط برای ادمین‌ها"""
+        user_id = update.effective_user.id
+        if not self.state.is_admin(user_id):
+            await update.message.reply_text("فقط ادمین‌ها دسترسی دارند.")
+            return
+        await self.send_recent_logs(update.effective_chat.id, context)
     
     # ==================== راهنما ====================
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4985,7 +5116,13 @@ class ScannerBot:
             
             # ====== پنل‌ها ======
             if data == "admin_panel":
-                await self.admin_panel(update, context)
+                await self.admin_panel(update, context, page=1)
+                return
+            if data == "admin_page_1":
+                await self.admin_panel(update, context, page=1)
+                return
+            if data == "admin_page_2":
+                await self.admin_panel(update, context, page=2)
                 return
             if data == "admin_config_scanner":
                 await self.config_scanner_panel(update, context)
@@ -5109,6 +5246,13 @@ class ScannerBot:
             if data == "admin_log_menu":
                 await self.admin_log_menu(update, context)
                 return
+            if data == "admin_get_logs":
+                if not self.state.is_admin(user_id):
+                    await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+                    return
+                await query.answer("⏳ در حال آماده‌سازی لاگ‌ها...")
+                await self.send_recent_logs(query.message.chat_id, context)
+                return
             
             await query.answer("❌ دکمه نامعتبر!")
         except Exception as e:
@@ -5190,6 +5334,7 @@ class ScannerBot:
         
         # ثبت هندلرها
         self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("logs", self.logs_command))
         self.application.add_handler(CallbackQueryHandler(self.button_handler))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
         self.application.add_handler(MessageHandler(filters.PHOTO, self.message_handler))
@@ -5201,6 +5346,7 @@ class ScannerBot:
         
         # شروع تسک‌های پس‌زمینه
         asyncio.create_task(self.scanner.scanner_loop())
+        asyncio.create_task(self.scanner.topic_forward_loop())
         asyncio.create_task(self.keep_alive())
         
         # ============ راه‌اندازی وب‌سرور با Webhook ============
