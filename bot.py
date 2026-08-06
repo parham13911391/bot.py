@@ -9,12 +9,13 @@ import random
 import json
 import logging
 import time
+import html
 import asyncpg
 from datetime import datetime, timedelta
 from collections import deque
 from typing import Optional, Dict, Set, List, Tuple, Any
 from dataclasses import dataclass, field
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import ChatAdminRequiredError, UserNotParticipantError, RPCError, FloodWaitError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
@@ -161,6 +162,18 @@ class Database:
                     sent_to_channel BOOLEAN DEFAULT TRUE,
                     sent_to_topic BOOLEAN DEFAULT FALSE,
                     sent_at TIMESTAMP DEFAULT NOW()
+                )
+            ''')
+            
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS github_queue (
+                    id SERIAL PRIMARY KEY,
+                    config_text TEXT,
+                    config_hash TEXT UNIQUE,
+                    source_url TEXT,
+                    sent BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    sent_at TIMESTAMP
                 )
             ''')
             
@@ -699,6 +712,76 @@ class Database:
                 'total': total[0] if total else 0,
                 'remaining': remaining[0] if remaining else 0
             }
+    
+    # ==================== متدهای صف کانفنیگ GitHub ====================
+    async def add_github_configs_to_queue(self, configs: List[str], source_url: str = None) -> Dict:
+        """اضافه کردن لیست کانفنیگ‌های گیت‌هاب به صف"""
+        async with self.pool.acquire() as conn:
+            added = 0
+            duplicate = 0
+            invalid = 0
+            
+            valid_patterns = ['vless://', 'vmess://', 'trojan://', 'ss://', 'hy2://', 'wireguard://']
+            
+            for config in configs:
+                config = config.strip()
+                if not config:
+                    continue
+                
+                is_valid = any(config.startswith(p) for p in valid_patterns)
+                if not is_valid:
+                    invalid += 1
+                    continue
+                
+                clean_config = config.split('#')[0] if '#' in config else config
+                config_hash = str(abs(hash(clean_config)))
+                
+                existing = await conn.fetchrow('SELECT id FROM github_queue WHERE config_hash = $1', config_hash)
+                if existing:
+                    duplicate += 1
+                    continue
+                
+                sent = await conn.fetchrow('SELECT id FROM sent_configs WHERE config_hash = $1', config_hash)
+                if sent:
+                    duplicate += 1
+                    continue
+                
+                await conn.execute(
+                    'INSERT INTO github_queue (config_text, config_hash, source_url) VALUES ($1, $2, $3)',
+                    config, config_hash, source_url
+                )
+                added += 1
+            
+            return {
+                'added': added,
+                'duplicate': duplicate,
+                'invalid': invalid,
+                'total': len(configs)
+            }
+    
+    async def get_next_github_config_from_queue(self) -> Optional[str]:
+        """دریافت یک کانفنیگ گیت‌هاب از صف برای ارسال"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT id, config_text FROM github_queue WHERE sent = FALSE ORDER BY id LIMIT 1'
+            )
+            if row:
+                await conn.execute(
+                    'UPDATE github_queue SET sent = TRUE, sent_at = NOW() WHERE id = $1',
+                    row['id']
+                )
+                return row['config_text']
+            return None
+    
+    async def get_github_queue_stats(self) -> Dict:
+        """دریافت آمار صف گیت‌هاب"""
+        async with self.pool.acquire() as conn:
+            total = await conn.fetchrow('SELECT COUNT(*) FROM github_queue')
+            remaining = await conn.fetchrow('SELECT COUNT(*) FROM github_queue WHERE sent = FALSE')
+            return {
+                'total': total[0] if total else 0,
+                'remaining': remaining[0] if remaining else 0
+            }
 
 # ==================== لینک چنل‌ها ====================
 CHANNEL_1_LINK = "https://t.me/v2reya88"
@@ -776,6 +859,8 @@ class BotState:
     config_scanner_running: bool = False
     proxy_scanner_running: bool = False
     txt_scanner_running: bool = False
+    github_scanner_running: bool = False
+    github_source_url: Optional[str] = None
     config_log_enabled: bool = False
     proxy_log_enabled: bool = False
     send_to_topic_enabled: bool = True
@@ -830,6 +915,10 @@ class BotState:
     
     def is_admin(self, user_id: int) -> bool:
         return user_id == OWNER_ID or user_id in self.admins
+    
+    def is_owner(self, user_id: int) -> bool:
+        """فقط مالک اصلی ربات - ادمین‌های اضافه‌شده دسترسی ندارند"""
+        return user_id == OWNER_ID
     
     def is_banned(self, user_id: int) -> bool:
         return user_id in self.banned_users
@@ -922,6 +1011,30 @@ class ChannelScanner:
         self._semaphore = asyncio.Semaphore(2)
         self._txt_sending = False
         self._txt_task = None
+        self._github_sending = False
+        self._github_task = None
+    
+    def setup_live_forward(self):
+        """فورارد زنده: هر پیام جدیدی که در چنل v2reya88 ارسال شود،
+        بلافاصله دقیقاً داخل تاپیک هدف (CONFIG_TOPIC_ID) در گروه فورارد می‌شود.
+        این کار با همان کلاینت لاگین‌شده‌ی موجود (user_client) انجام می‌شود،
+        چون API_ID/API_HASH جدیدی که فرستادید بدون یک StringSession معتبر
+        (لاگین با شماره تلفن) قابل استفاده در سرور نیست."""
+        
+        @self.user_client.on(events.NewMessage(chats=CHANNEL_1_USERNAME))
+        async def _live_forward_handler(event):
+            try:
+                await self.user_client.forward_messages(
+                    entity=GROUP_ID,
+                    messages=event.message.id,
+                    from_peer=event.chat_id,
+                    top_msg_id=CONFIG_TOPIC_ID
+                )
+                logger.info(f"✅ Live-forwarded message {event.message.id} from {CHANNEL_1_USERNAME} to topic {CONFIG_TOPIC_ID}")
+            except Exception as e:
+                logger.error(f"Live forward error: {e}")
+        
+        logger.info(f"👂 Live forwarder registered: {CHANNEL_1_USERNAME} -> topic {CONFIG_TOPIC_ID}")
     
     async def check_flood_wait(self) -> Tuple[bool, int]:
         async with self._flood_lock:
@@ -1231,16 +1344,21 @@ class ChannelScanner:
             else:
                 config_text = config_text + '#@v2reya88%20%7C%20%40confinghub2'
             
-            message = f"""```{config_text}```
+            # از HTML به‌جای Markdown استفاده می‌کنیم چون کانفنیگ‌ها معمولاً شامل
+            # کاراکترهای _ * ` هستند که پارسر Markdown قدیمی را می‌شکند و باعث
+            # می‌شد پیام ناقص/نصفه ارسال یا کلاً رد شود. با escape کردن در HTML
+            # این مشکل کامل حل می‌شود.
+            safe_config_text = html.escape(config_text)
+            message = f"""<code>{safe_config_text}</code>
 
-📍 Location: {flag} {location.get('country', 'Unknown')}
-🏙️ City: {location.get('city', 'Unknown')}
+📍 Location: {flag} {html.escape(location.get('country', 'Unknown'))}
+🏙️ City: {html.escape(location.get('city', 'Unknown'))}
 
 @v2reya88 | @confinghub2"""
             
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("CHANNEL 1", url=CHANNEL_1_LINK, style="primary"),
+                    InlineKeyboardButton("CHANNEL 1", url=CHANNEL_1_LINK, style="danger"),
                     InlineKeyboardButton("CHANNEL 2", url=CHANNEL_2_LINK, style="danger")
                 ],
                 [
@@ -1251,7 +1369,7 @@ class ChannelScanner:
             sent_msg = await self.bot_app.bot.send_message(
                 chat_id=CONFIG_TARGET_CHANNEL,
                 text=message,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
                 reply_markup=keyboard
             )
             logger.info(f"✅ Config sent to channel: {CONFIG_TARGET_CHANNEL}")
@@ -1260,10 +1378,13 @@ class ChannelScanner:
             
             if self.state.send_to_topic_enabled and self.is_valid_config(config_text):
                 try:
+                    # top_msg_id ضروری است تا پیام دقیقاً داخل همان تاپیک هدف
+                    # ارسال شود، نه در تاپیک عمومی گروه.
                     await self.user_client.forward_messages(
                         entity=GROUP_ID,
                         messages=sent_msg.message_id,
-                        from_peer=CONFIG_TARGET_CHANNEL
+                        from_peer=CONFIG_TARGET_CHANNEL,
+                        top_msg_id=CONFIG_TOPIC_ID
                     )
                     sent_to_topic = True
                     logger.info(f"✅ Config forwarded to topic")
@@ -1298,13 +1419,13 @@ class ChannelScanner:
             
             channel_message = f"""now proxy ⚡️
 
-📍 Location: {flag} {info.get('country', 'Unknown')}
+📍 Location: {flag} {html.escape(info.get('country', 'Unknown'))}
 
 @v2reya88 | @confinghub2"""
             
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("CONNECT", url=proxy_url, style="primary"),
+                    InlineKeyboardButton("CONNECT", url=proxy_url, style="danger"),
                     InlineKeyboardButton("CHANNEL", url=CHANNEL_2_LINK, style="danger")
                 ],
                 [
@@ -1315,7 +1436,7 @@ class ChannelScanner:
             sent_msg = await self.bot_app.bot.send_message(
                 chat_id=PROXY_TARGET_CHANNEL,
                 text=channel_message,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
                 reply_markup=keyboard
             )
             logger.info(f"✅ Proxy sent to channel: {PROXY_TARGET_CHANNEL}")
@@ -1327,7 +1448,8 @@ class ChannelScanner:
                     await self.user_client.forward_messages(
                         entity=GROUP_ID,
                         messages=sent_msg.message_id,
-                        from_peer=PROXY_TARGET_CHANNEL
+                        from_peer=PROXY_TARGET_CHANNEL,
+                        top_msg_id=PROXY_TOPIC_ID
                     )
                     sent_to_topic = True
                     logger.info(f"✅ Proxy forwarded to topic")
@@ -1400,6 +1522,65 @@ class ChannelScanner:
             self._txt_sending = False
             logger.info("📂 TXT configs sender stopped.")
     
+    # ==================== GitHub ====================
+    async def fetch_github_configs(self, url: str) -> Dict:
+        """دانلود لینک گیت‌هاب (raw) و استخراج کانفنیگ‌ها و اضافه کردن به صف"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as response:
+                    if response.status != 200:
+                        return {'ok': False, 'error': f"HTTP {response.status}"}
+                    raw = await response.text(errors='ignore')
+        except Exception as e:
+            logger.error(f"GitHub fetch error: {e}")
+            return {'ok': False, 'error': str(e)}
+        
+        # بعضی لینک‌ها JSON هستند (مثل serverless.json) - هم متن خام و هم
+        # مقادیر رشته‌ای داخل JSON را برای پیدا کردن کانفنیگ بررسی می‌کنیم
+        configs = await self.extract_configs_from_text(raw)
+        if not configs:
+            try:
+                data = json.loads(raw)
+                configs = await self.extract_configs_from_text(json.dumps(data))
+            except Exception:
+                pass
+        
+        result = await self.db.add_github_configs_to_queue(configs, source_url=url)
+        result['ok'] = True
+        return result
+    
+    async def process_github_configs(self):
+        """ارسال کانفنیگ‌های صف گیت‌هاب - هر ۳۰ ثانیه یکی، مستقل از اسکنر واقعی"""
+        if self._github_sending:
+            return
+        
+        self._github_sending = True
+        logger.info("🐙 Starting GitHub configs sender...")
+        
+        try:
+            while self.state.github_scanner_running:
+                config_text = await self.db.get_next_github_config_from_queue()
+                
+                if not config_text:
+                    logger.info("🐙 No more GitHub configs in queue. Stopping GitHub scanner...")
+                    self.state.github_scanner_running = False
+                    await self.db.set_scanner_state("github_scanner", "False")
+                    break
+                
+                logger.info("📤 Sending GitHub config...")
+                success = await self.send_config(config_text, "GitHub")
+                
+                if success:
+                    await asyncio.sleep(30)
+                else:
+                    await asyncio.sleep(5)
+                
+        except Exception as e:
+            logger.error(f"❌ GitHub sender error: {e}")
+        finally:
+            self._github_sending = False
+            logger.info("🐙 GitHub configs sender stopped.")
+    
     async def scanner_loop(self):
         logger.info("🔄 Scanner loop started (Every 3 seconds)...")
         
@@ -1458,7 +1639,12 @@ class ChannelScanner:
                     if not self._txt_sending:
                         asyncio.create_task(self.process_txt_configs())
                 
-                if not self.state.config_scanner_running and not self.state.proxy_scanner_running and not self.state.txt_scanner_running:
+                # ====== اسکنر GitHub - مستقل، کنار اسکنر واقعی ======
+                if self.state.github_scanner_running:
+                    if not self._github_sending:
+                        asyncio.create_task(self.process_github_configs())
+                
+                if not self.state.config_scanner_running and not self.state.proxy_scanner_running and not self.state.txt_scanner_running and not self.state.github_scanner_running:
                     await asyncio.sleep(5)
                     
             except Exception as e:
@@ -1492,7 +1678,10 @@ class ChannelScanner:
             # دانلود فایل
             file = await self.bot_app.bot.get_file(document.file_id)
             file_content = await file.download_as_bytearray()
-            text_content = file_content.decode('utf-8', errors='ignore')
+            # utf-8-sig برای حذف BOM احتمالی + نرمال‌سازی \r\n که باعث
+            # می‌شد بعضی خط‌ها هنگام استخراج نصفه/بهم‌چسبیده دیده شوند
+            text_content = bytes(file_content).decode('utf-8-sig', errors='ignore')
+            text_content = text_content.replace('\r\n', '\n').replace('\r', '\n')
             
             # استخراج کانفنیگ‌ها
             configs = await self.extract_configs_from_text(text_content)
@@ -1584,7 +1773,7 @@ class ScannerBot:
     def membership_buttons(self):
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("چنل کانفنیگ", url=CHANNEL_1_LINK, style="primary"),
+                InlineKeyboardButton("چنل کانفنیگ", url=CHANNEL_1_LINK, style="danger"),
                 InlineKeyboardButton("چنل پروکسی", url=CHANNEL_2_LINK, style="danger")
             ],
             [
@@ -1595,23 +1784,23 @@ class ScannerBot:
     def user_panel_buttons(self):
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("خرید کانفنیگ", callback_data="buy_config", style="primary"),
-                InlineKeyboardButton("دریافت کانفنیگ", callback_data="get_my_config", style="primary")
+                InlineKeyboardButton("خرید کانفنیگ", callback_data="buy_config", style="danger"),
+                InlineKeyboardButton("دریافت کانفنیگ", callback_data="get_my_config", style="danger")
             ],
             [
-                InlineKeyboardButton("آیپی من", callback_data="my_ip", style="danger"),
-                InlineKeyboardButton("رفرال", callback_data="referral", style="danger")
+                InlineKeyboardButton("آیپی من", callback_data="my_ip", style="success"),
+                InlineKeyboardButton("رفرال", callback_data="referral", style="success")
             ],
             [
-                InlineKeyboardButton("ردیم کد", callback_data="redeem", style="success"),
-                InlineKeyboardButton("زبان", callback_data="language", style="success")
+                InlineKeyboardButton("ردیم کد", callback_data="redeem", style="primary"),
+                InlineKeyboardButton("زبان", callback_data="language", style="primary")
             ],
             [
-                InlineKeyboardButton("راهنما", callback_data="help", style="primary"),
-                InlineKeyboardButton("AI", callback_data="ai_panel", style="primary")
+                InlineKeyboardButton("راهنما", callback_data="help", style="danger"),
+                InlineKeyboardButton("AI", callback_data="ai_panel", style="danger")
             ],
             [
-                InlineKeyboardButton("گزارش مشکل", callback_data="report_issue", style="danger")
+                InlineKeyboardButton("گزارش مشکل", callback_data="report_issue", style="success")
             ]
         ])
     
@@ -1659,17 +1848,17 @@ class ScannerBot:
     
     def plan_info_buttons(self, plan_key: str):
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 پرداخت کارت به کارت", callback_data=f"payment_card_{plan_key}", style="primary")],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_buy", style="danger")]
+            [InlineKeyboardButton("💳 پرداخت کارت به کارت", callback_data=f"payment_card_{plan_key}", style="danger")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_buy", style="success")]
         ])
     
     def card_info_buttons(self, card_number: str):
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📋 کپی شماره کارت", callback_data=f"copy_card_{card_number}", style="primary"),
-                InlineKeyboardButton("📤 ارسال رسید", callback_data="send_receipt", style="success")
+                InlineKeyboardButton("📋 کپی شماره کارت", callback_data=f"copy_card_{card_number}", style="danger"),
+                InlineKeyboardButton("📤 ارسال رسید", callback_data="send_receipt", style="danger")
             ],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_buy", style="danger")]
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_buy", style="success")]
         ])
     
     def receipt_back_buttons(self):
@@ -1680,48 +1869,53 @@ class ScannerBot:
     def admin_panel_buttons(self):
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("اسکنر کانفنیگ", callback_data="admin_config_scanner", style="primary"),
-                InlineKeyboardButton("اسکنر پروکسی", callback_data="admin_proxy_scanner", style="primary"),
-                InlineKeyboardButton("کانفنیگ TXT", callback_data="admin_txt_scanner", style="success")
+                InlineKeyboardButton("اسکنر کانفنیگ", callback_data="admin_config_scanner", style="danger"),
+                InlineKeyboardButton("اسکنر پروکسی", callback_data="admin_proxy_scanner", style="danger"),
+                InlineKeyboardButton("کانفنیگ TXT", callback_data="admin_txt_scanner", style="danger")
             ],
             [
                 InlineKeyboardButton("📊 آمار کامل", callback_data="admin_stats_full", style="success"),
                 InlineKeyboardButton("ساخت ردیم کد", callback_data="admin_gen_redeem", style="success"),
-                InlineKeyboardButton("ارسال همگانی", callback_data="admin_broadcast", style="danger")
+                InlineKeyboardButton("ارسال همگانی", callback_data="admin_broadcast", style="success")
             ],
             [
                 InlineKeyboardButton("مدیریت سفارشات", callback_data="admin_orders", style="primary"),
-                InlineKeyboardButton("افزودن ادمین", callback_data="admin_add_admin", style="success"),
-                InlineKeyboardButton("حذف ادمین", callback_data="admin_remove_admin", style="danger")
+                InlineKeyboardButton("افزودن ادمین", callback_data="admin_add_admin", style="primary"),
+                InlineKeyboardButton("حذف ادمین", callback_data="admin_remove_admin", style="primary")
             ],
             [
-                InlineKeyboardButton("لیست ادمین‌ها", callback_data="admin_list", style="primary"),
+                InlineKeyboardButton("لیست ادمین‌ها", callback_data="admin_list", style="danger"),
                 InlineKeyboardButton("بن/آنبن", callback_data="admin_ban_menu", style="danger"),
-                InlineKeyboardButton("لاگ‌ها", callback_data="admin_log_menu", style="primary")
+                InlineKeyboardButton("لاگ‌ها", callback_data="admin_log_menu", style="danger")
             ],
             [
                 InlineKeyboardButton("لیست خریدهای موفق", callback_data="admin_successful_orders", style="success"),
                 InlineKeyboardButton("لیست گزارشات", callback_data="admin_report_list", style="success"),
-                InlineKeyboardButton("ارسال به تاپیک", callback_data="admin_topic", style="primary")
+                InlineKeyboardButton("ارسال به تاپیک", callback_data="admin_topic", style="success")
             ],
             [
                 InlineKeyboardButton("درخواست‌های ردیم کد", callback_data="admin_redeem_requests", style="primary"),
-                InlineKeyboardButton("پاسخ مجدد به گزارش", callback_data="admin_reply_again", style="primary"),
-                InlineKeyboardButton("بازگشت", callback_data="back_main", style="danger")
+                InlineKeyboardButton("پاسخ مجدد به گزارش", callback_data="admin_reply_again", style="primary")
+            ],
+            [
+                InlineKeyboardButton("GitHub", callback_data="admin_github", style="danger")
+            ],
+            [
+                InlineKeyboardButton("بازگشت", callback_data="back_main", style="success")
             ]
         ])
     
     def admin_orders_buttons(self):
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 لیست سفارشات", callback_data="admin_order_list", style="primary")],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="danger")]
+            [InlineKeyboardButton("📋 لیست سفارشات", callback_data="admin_order_list", style="danger")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="success")]
         ])
     
     def admin_report_buttons(self):
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 لیست گزارشات", callback_data="admin_report_list", style="primary")],
+            [InlineKeyboardButton("📋 لیست گزارشات", callback_data="admin_report_list", style="danger")],
             [InlineKeyboardButton("📝 پاسخ به گزارش", callback_data="admin_reply_report", style="success")],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="danger")]
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="primary")]
         ])
     
     def topic_buttons(self):
@@ -1731,7 +1925,7 @@ class ScannerBot:
                 InlineKeyboardButton("روشن", callback_data="topic_on", style="success"),
                 InlineKeyboardButton("خاموش", callback_data="topic_off", style="danger")
             ],
-            [InlineKeyboardButton("بازگشت", callback_data="back_to_admin", style="primary")]
+            [InlineKeyboardButton("بازگشت", callback_data="back_to_admin", style="success")]
         ])
     
     def txt_scanner_buttons(self):
@@ -1742,10 +1936,24 @@ class ScannerBot:
                 InlineKeyboardButton("⏹ توقف", callback_data="txt_stop", style="danger")
             ],
             [
-                InlineKeyboardButton("📤 ارسال فایل TXT", callback_data="txt_upload", style="primary")
+                InlineKeyboardButton("📤 ارسال فایل TXT", callback_data="txt_upload", style="success")
             ],
             [
                 InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="primary")
+            ]
+        ])
+    
+    def github_scanner_buttons(self):
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("START", callback_data="github_start", style="success"),
+                InlineKeyboardButton("STOP", callback_data="github_stop", style="danger")
+            ],
+            [
+                InlineKeyboardButton("Send Link", callback_data="github_link")
+            ],
+            [
+                InlineKeyboardButton("Back", callback_data="back_to_admin", style="primary")
             ]
         ])
     
@@ -1753,11 +1961,11 @@ class ScannerBot:
         if self.state.is_admin(user_id):
             return InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("پنل ادمین", callback_data="admin_panel", style="primary"),
-                    InlineKeyboardButton("پنل کاربری", callback_data="user_panel", style="success")
+                    InlineKeyboardButton("پنل ادمین", callback_data="admin_panel", style="danger"),
+                    InlineKeyboardButton("پنل کاربری", callback_data="user_panel", style="danger")
                 ],
                 [
-                    InlineKeyboardButton("زبان", callback_data="language", style="danger")
+                    InlineKeyboardButton("زبان", callback_data="language", style="success")
                 ]
             ])
         else:
@@ -1766,19 +1974,19 @@ class ScannerBot:
     def ai_panel_buttons(self):
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("💬 چت هوشمند", callback_data="ai_chat", style="success"),
+                InlineKeyboardButton("💬 چت هوشمند", callback_data="ai_chat", style="danger"),
                 InlineKeyboardButton("📝 تحلیل کد", callback_data="ai_code", style="danger")
             ],
             [
-                InlineKeyboardButton("📖 راهنما", callback_data="ai_help", style="primary"),
-                InlineKeyboardButton("🔙 بازگشت", callback_data="back_main", style="danger")
+                InlineKeyboardButton("📖 راهنما", callback_data="ai_help", style="success"),
+                InlineKeyboardButton("🔙 بازگشت", callback_data="back_main", style="success")
             ]
         ])
     
     def language_buttons(self):
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("English", callback_data="lang_en", style="primary"),
+                InlineKeyboardButton("English", callback_data="lang_en", style="danger"),
                 InlineKeyboardButton("فارسی", callback_data="lang_fa", style="danger")
             ]
         ])
@@ -2145,8 +2353,8 @@ class ScannerBot:
 """
             
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 بروزرسانی", callback_data="admin_stats_full", style="primary")],
-                [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="danger")]
+                [InlineKeyboardButton("🔄 بروزرسانی", callback_data="admin_stats_full", style="danger")],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="success")]
             ])
             
             await query.edit_message_text(
@@ -2412,11 +2620,11 @@ class ScannerBot:
             
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✅ تایید", callback_data=f"confirm_order_{user_id}", style="success"),
+                    InlineKeyboardButton("✅ تایید", callback_data=f"confirm_order_{user_id}", style="danger"),
                     InlineKeyboardButton("❌ عدم تایید", callback_data=f"reject_order_{user_id}", style="danger")
                 ],
                 [
-                    InlineKeyboardButton("🔙 بازگشت", callback_data="admin_order_list", style="primary")
+                    InlineKeyboardButton("🔙 بازگشت", callback_data="admin_order_list", style="success")
                 ]
             ])
             
@@ -2587,7 +2795,7 @@ class ScannerBot:
             await query.edit_message_text(
                 "✅ خریدها با موفقیت دانلود شد!",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_successful_orders", style="primary")]
+                    [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_successful_orders", style="danger")]
                 ])
             )
             
@@ -2700,7 +2908,7 @@ class ScannerBot:
             await query.edit_message_text(
                 "✅ گزارشات با موفقیت دانلود شد!",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_report_list", style="primary")]
+                    [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_report_list", style="danger")]
                 ])
             )
             
@@ -2916,7 +3124,7 @@ class ScannerBot:
             
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✅ تایید", callback_data=f"confirm_order_{user_id}", style="success"),
+                    InlineKeyboardButton("✅ تایید", callback_data=f"confirm_order_{user_id}", style="danger"),
                     InlineKeyboardButton("❌ عدم تایید", callback_data=f"reject_order_{user_id}", style="danger")
                 ]
             ])
@@ -3108,7 +3316,7 @@ class ScannerBot:
         
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📞 گزارش مشکل", callback_data=f"report_{config_id}", style="danger")],
-            [InlineKeyboardButton("🔙 منو اصلی", callback_data="back_main", style="primary")]
+            [InlineKeyboardButton("🔙 منو اصلی", callback_data="back_main", style="success")]
         ])
         
         try:
@@ -3159,9 +3367,9 @@ class ScannerBot:
         eligible_codes = count // 3
         
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 کپی لینک", callback_data=f"copy_ref_{user_id}", style="primary")],
+            [InlineKeyboardButton("📋 کپی لینک", callback_data=f"copy_ref_{user_id}", style="danger")],
             [InlineKeyboardButton("🎁 دریافت کد تخفیف", callback_data="get_referral_reward", style="success")],
-            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_user", style="danger")]
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_user", style="primary")]
         ])
         
         await query.edit_message_text(
@@ -3218,7 +3426,7 @@ class ScannerBot:
             f"📌 هر کد فقط یک بار قابل استفاده است.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 بازگشت به رفرال", callback_data="referral", style="primary")]
+                [InlineKeyboardButton("🔙 بازگشت به رفرال", callback_data="referral", style="danger")]
             ])
         )
     
@@ -3276,7 +3484,7 @@ class ScannerBot:
                 try:
                     keyboard = InlineKeyboardMarkup([
                         [
-                            InlineKeyboardButton("✅ تایید", callback_data=f"approve_redeem_{request_id}", style="success"),
+                            InlineKeyboardButton("✅ تایید", callback_data=f"approve_redeem_{request_id}", style="danger"),
                             InlineKeyboardButton("❌ رد", callback_data=f"reject_redeem_{request_id}", style="danger")
                         ]
                     ])
@@ -3430,10 +3638,10 @@ class ScannerBot:
         
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("مشکل کانفنیگ خرید", callback_data="report_bought", style="danger")],
-            [InlineKeyboardButton("مشکل کانفنیگ رایگان", callback_data="report_free", style="primary")],
-            [InlineKeyboardButton("مشکل پرداخت", callback_data="report_payment", style="danger")],
-            [InlineKeyboardButton("سایر مشکلات", callback_data="report_other", style="primary")],
-            [InlineKeyboardButton("بازگشت", callback_data="back_main", style="primary")]
+            [InlineKeyboardButton("مشکل کانفنیگ رایگان", callback_data="report_free", style="success")],
+            [InlineKeyboardButton("مشکل پرداخت", callback_data="report_payment", style="primary")],
+            [InlineKeyboardButton("سایر مشکلات", callback_data="report_other", style="danger")],
+            [InlineKeyboardButton("بازگشت", callback_data="back_main", style="success")]
         ])
         
         await query.edit_message_text(
@@ -3522,7 +3730,7 @@ class ScannerBot:
             """
             
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("پاسخ", callback_data=f"reply_report_{report_id}", style="primary")]
+                [InlineKeyboardButton("پاسخ", callback_data=f"reply_report_{report_id}", style="danger")]
             ])
             
             for admin_id in self.state.admins:
@@ -3693,7 +3901,7 @@ class ScannerBot:
             
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📞 گزارش مشکل", callback_data=f"report_{config_id}", style="danger")],
-                [InlineKeyboardButton("🔙 بازگشت", callback_data="get_my_config", style="primary")]
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="get_my_config", style="success")]
             ])
             
             await query.edit_message_text(
@@ -3882,7 +4090,7 @@ class ScannerBot:
                 InlineKeyboardButton("⏹ توقف", callback_data="config_stop", style="danger")
             ],
             [
-                InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="primary")
+                InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="success")
             ]
         ])
         
@@ -3912,7 +4120,7 @@ class ScannerBot:
                 InlineKeyboardButton("⏹ توقف", callback_data="proxy_stop", style="danger")
             ],
             [
-                InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="primary")
+                InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="success")
             ]
         ])
         
@@ -3925,6 +4133,72 @@ class ScannerBot:
             f"پروکسی ارسال شده: {sent_count}",
             reply_markup=keyboard,
             parse_mode=ParseMode.MARKDOWN
+        )
+    
+    # ==================== GitHub ====================
+    async def admin_github_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        
+        status = "Running" if self.state.github_scanner_running else "Stopped"
+        stats = await self.db.get_github_queue_stats()
+        
+        await query.edit_message_text(
+            f"GitHub Config Source\n\n"
+            f"Status: {status}\n"
+            f"Current link: {self.state.github_source_url or '-'}\n"
+            f"Total in queue: {stats.get('total', 0)}\n"
+            f"Remaining to send: {stats.get('remaining', 0)}\n\n"
+            f"Send a GitHub raw link to load configs from it. "
+            f"After Start, one config is sent every 30 seconds alongside the real scanner.",
+            reply_markup=self.github_scanner_buttons()
+        )
+    
+    async def github_link_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        context.user_data['waiting_for_github_link'] = True
+        await query.answer()
+        await query.edit_message_text(
+            "Send the GitHub link (raw file URL):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Back", callback_data="admin_github", style="danger")]
+            ])
+        )
+    
+    async def receive_github_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        url = (message.text or "").strip()
+        context.user_data['waiting_for_github_link'] = False
+        
+        if not url.startswith("http://") and not url.startswith("https://"):
+            await message.reply_text("❌ لینک معتبر نیست. لطفاً یک لینک http/https ارسال کنید.")
+            return
+        
+        wait_msg = await message.reply_text("🔄 در حال دریافت و بررسی لینک...")
+        
+        result = await self.scanner.fetch_github_configs(url)
+        
+        if not result.get('ok'):
+            await wait_msg.edit_text(f"❌ خطا در دریافت لینک: {result.get('error', 'unknown')}")
+            return
+        
+        self.state.github_source_url = url
+        
+        await wait_msg.edit_text(
+            f"✅ {result['added']} کانفنیگ پیدا شد.\n\n"
+            f"🔄 تکراری: {result['duplicate']}\n"
+            f"❌ نامعتبر: {result['invalid']}\n"
+            f"📦 کل موارد داخل فایل: {result['total']}\n\n"
+            f"برای شروع ارسال (هر ۳۰ ثانیه یک کانفنیگ) دکمه START را در پنل GitHub بزنید.",
+            reply_markup=self.github_scanner_buttons()
         )
     
     # ==================== مدیریت ادمین ====================
@@ -4173,7 +4447,7 @@ class ScannerBot:
         await query.edit_message_text(
             "Language set to English!",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="back_main", style="primary")]
+                [InlineKeyboardButton("🔙 Back", callback_data="back_main", style="danger")]
             ])
         )
     
@@ -4186,7 +4460,7 @@ class ScannerBot:
         await query.edit_message_text(
             "زبان به فارسی تغییر کرد!",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main", style="primary")]
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="back_main", style="danger")]
             ])
         )
     
@@ -4332,6 +4606,11 @@ class ScannerBot:
         if context.user_data.get('waiting_for_txt') and message.document:
             await self.scanner.handle_txt_file(update, context)
             context.user_data['waiting_for_txt'] = False
+            return
+        
+        # دریافت لینک GitHub
+        if context.user_data.get('waiting_for_github_link') and message.text:
+            await self.receive_github_link(update, context)
             return
         
         # دریافت رسید
@@ -4714,6 +4993,12 @@ class ScannerBot:
             if data == "admin_proxy_scanner":
                 await self.proxy_scanner_panel(update, context)
                 return
+            if data == "admin_github":
+                await self.admin_github_panel(update, context)
+                return
+            if data == "github_link":
+                await self.github_link_prompt(update, context)
+                return
             if data == "user_panel":
                 await self.user_panel(update, context)
                 return
@@ -4722,7 +5007,13 @@ class ScannerBot:
                 return
             
             # ====== کنترل اسکنر ======
+            # نکته: شروع/توقف اسکنر کانفنیگ و اسکنر GitHub فقط برای مالک اصلی
+            # ربات مجاز است. ادمین‌هایی که بعداً اضافه می‌شوند فقط می‌توانند
+            # وضعیت را ببینند، نه روشن/خاموشش کنند.
             if data == "config_start":
+                if not self.state.is_owner(user_id):
+                    await query.answer("❌ فقط مالک ربات می‌تواند این اسکنر را روشن/خاموش کند.", show_alert=True)
+                    return
                 if self.state.config_scanner_running:
                     await query.answer("اسکنر در حال اجراست!", show_alert=True)
                     return
@@ -4732,6 +5023,9 @@ class ScannerBot:
                 await self.config_scanner_panel(update, context)
                 return
             if data == "config_stop":
+                if not self.state.is_owner(user_id):
+                    await query.answer("❌ فقط مالک ربات می‌تواند این اسکنر را روشن/خاموش کند.", show_alert=True)
+                    return
                 if not self.state.config_scanner_running:
                     await query.answer("اسکنر در حال اجرا نیست!", show_alert=True)
                     return
@@ -4739,6 +5033,34 @@ class ScannerBot:
                 await self.db.set_scanner_state("config_scanner", "False")
                 await query.answer("⏹ اسکن کانفنیگ متوقف شد!", show_alert=True)
                 await self.config_scanner_panel(update, context)
+                return
+            if data == "github_start":
+                if not self.state.is_owner(user_id):
+                    await query.answer("❌ فقط مالک ربات می‌تواند این اسکنر را روشن/خاموش کند.", show_alert=True)
+                    return
+                if self.state.github_scanner_running:
+                    await query.answer("Already running!", show_alert=True)
+                    return
+                stats = await self.db.get_github_queue_stats()
+                if stats.get('remaining', 0) <= 0:
+                    await query.answer("Queue is empty. Send a GitHub link first.", show_alert=True)
+                    return
+                self.state.github_scanner_running = True
+                await self.db.set_scanner_state("github_scanner", "True")
+                await query.answer("✅ Started!", show_alert=True)
+                await self.admin_github_panel(update, context)
+                return
+            if data == "github_stop":
+                if not self.state.is_owner(user_id):
+                    await query.answer("❌ فقط مالک ربات می‌تواند این اسکنر را روشن/خاموش کند.", show_alert=True)
+                    return
+                if not self.state.github_scanner_running:
+                    await query.answer("Not running!", show_alert=True)
+                    return
+                self.state.github_scanner_running = False
+                await self.db.set_scanner_state("github_scanner", "False")
+                await query.answer("⏹ Stopped!", show_alert=True)
+                await self.admin_github_panel(update, context)
                 return
             if data == "proxy_start":
                 if self.state.proxy_scanner_running:
@@ -4830,12 +5152,16 @@ class ScannerBot:
             txt_state = await self.db.get_scanner_state("txt_scanner")
             self.state.txt_scanner_running = txt_state == "True"
             
-            logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running}, Proxy: {self.state.proxy_scanner_running}, TXT: {self.state.txt_scanner_running}")
+            github_state = await self.db.get_scanner_state("github_scanner")
+            self.state.github_scanner_running = github_state == "True"
+            
+            logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running}, Proxy: {self.state.proxy_scanner_running}, TXT: {self.state.txt_scanner_running}, GitHub: {self.state.github_scanner_running}")
         except Exception as e:
             logger.error(f"Error loading scanner states: {e}")
             self.state.config_scanner_running = False
             self.state.proxy_scanner_running = False
             self.state.txt_scanner_running = False
+            self.state.github_scanner_running = False
         
         # اتصال به اکانت تلگرام
         if not USER_SESSION_STR:
@@ -4860,6 +5186,7 @@ class ScannerBot:
         self.application.add_error_handler(self.error_handler)
         
         self.scanner = ChannelScanner(self.state, self.db, self.user_client, self.application)
+        self.scanner.setup_live_forward()
         
         # ثبت هندلرها
         self.application.add_handler(CommandHandler("start", self.start_command))
