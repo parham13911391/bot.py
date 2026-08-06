@@ -843,8 +843,44 @@ PROXY_TOPIC_ID = 108613
 
 # ==================== لیست چنل‌های منبع ====================
 SOURCE_CONFIG_CHANNELS = [
+    "@SOSkeyNET",
+    "@Outline_Vpn",
+    "@V2All",
+    "@icv2ray",
+    "@appsooner",
+    "@V2ray_official",
+    "@meliproxyy",
+    "@mehrosaboran",
+    "@bored_vpn",
+    "@KAFING_2",
+    "@v2rayngzendegimamad",
+    "@Vpn_jet7",
+    "@oneclickvpnkeys",
+    "@filtershekan_channel",
+    "@V2raysCollector",
+    "@Vasl_b",
+    "@hi_proxy_iran",
+    "@proxy_kafee",
+    "@v2rayNplus",
+    "@HiByeVPNN",
+    "@Farah_VPN",
+    "@outline_ir",
+    "@FREECONFIGSPLUS",
+    "@on_proxy1",
+    "@NamazVPN",
+    "@FreeConfigForYou",
+    "@V2ngFast",
+    "@VPN_PASARGAD",
+    "@FreeOnlineVPN",
     "@FarazV2ray",
-    "@ConfigsHUB"
+    "@SheriffNet",
+    "@filembad",
+    "@PrivateVPNs",
+    "@chillguy_vpn",
+    "@free_conf_iran",
+    "@Shh_Proxy",
+    "@v2raydia",
+    "@Natrixo"
 ]
 
 SOURCE_PROXY_CHANNELS = [
@@ -1057,6 +1093,8 @@ class ChannelScanner:
         self._txt_task = None
         self._github_sending = False
         self._github_task = None
+        self._config_queue = asyncio.Queue()
+        self._proxy_queue = asyncio.Queue()
     
     def setup_live_forward(self):
         """فورارد زنده: هر پیام جدیدی که در چنل v2reya88 ارسال شود،
@@ -1085,15 +1123,15 @@ class ChannelScanner:
         logger.info(f"👂 Live forwarder registered: {CHANNEL_1_USERNAME} -> topic {CONFIG_TOPIC_ID}")
 
     async def topic_forward_loop(self):
-        """هر ۱۰ ثانیه، جدیدترین پیام چنل ۱ (کانفنیگ) و چنل ۲ (پروکسی) رو
-        چک می‌کنه و اگه فرق داشت با پیامی که قبلاً فورارد شده، به تاپیک
-        مربوطه توی گروه فورارد می‌کنه. این یه لایه‌ی پشتیبان برای
-        live-forward هست، چون بعضی وقت‌ها event لحظه‌ای به هر دلیلی
-        (قطعی موقت، ری‌کانکت و ...) از دست می‌ره."""
+        """هر ۱۰ ثانیه، جدیدترین پیام چنل کانفنیگ (v2reya88) رو چک می‌کنه
+        و اگه فرق داشت با پیامی که قبلاً فورارد شده، به تاپیک کانفنیگ توی
+        گروه فورارد می‌کنه. طبق درخواست، فقط همین یک چنل فورارد می‌شه، نه
+        دو چنل. این یه لایه‌ی پشتیبان برای live-forward هست، چون بعضی
+        وقت‌ها event لحظه‌ای به هر دلیلی (قطعی موقت، ری‌کانکت و ...) از
+        دست می‌ره."""
         logger.info("⏱️ Topic forward loop (هر ۱۰ ثانیه) شروع شد")
         sources = [
             (CHANNEL_1_USERNAME, CONFIG_TOPIC_ID),
-            (CHANNEL_2_USERNAME, PROXY_TOPIC_ID),
         ]
         while True:
             try:
@@ -1501,8 +1539,10 @@ class ChannelScanner:
                 logger.info(f"⏭️ Proxy already sent: {proxy_hash[:10]}...")
                 return True
             
-            channel_message = f"""now proxy ⚡️
+            safe_proxy_url = html.escape(proxy_url)
+            channel_message = f"""<code>{safe_proxy_url}</code>
 
+now proxy ⚡️
 📍 Location: {flag} {html.escape(info.get('country', 'Unknown'))}
 
 @v2reya88 | @confinghub2"""
@@ -1666,58 +1706,16 @@ class ChannelScanner:
             logger.info("🐙 GitHub configs sender stopped.")
     
     async def scanner_loop(self):
-        logger.info("🔄 Scanner loop started (Every 3 seconds)...")
+        """این لوپ فقط مسئول تریگر زدن اسکنر TXT و GitHub هست.
+        اسکن/ارسال کانفنیگ و پروکسی به دو جفت لوپ producer/consumer
+        جدا منتقل شده (config_producer_loop + config_sender_loop و
+        proxy_producer_loop + proxy_sender_loop) تا سرعت پیدا کردن از
+        سرعت ارسال جدا باشه و بشه گارانتی کرد حداقل هر ۱۰ ثانیه یک
+        کانفنیگ ارسال میشه."""
+        logger.info("🔄 Scanner loop (TXT/GitHub triggers) started...")
         
         while True:
             try:
-                # ====== اسکنر کانفنیگ از چنل‌ها ======
-                if self.state.config_scanner_running:
-                    for channel in SOURCE_CONFIG_CHANNELS:
-                        if not self.state.config_scanner_running:
-                            break
-                        
-                        logger.info(f"🔍 Scanning config: {channel}")
-                        msg, config_text = await self.scan_config_channel(channel)
-                        
-                        if config_text:
-                            config_hash = str(abs(hash(config_text.split('#')[0])))
-                            if not await self.db.is_config_sent(config_hash):
-                                self.state.add_config_hash(config_hash)
-                                logger.info(f"✅ New config from {channel}")
-                                success = await self.send_config(config_text, channel)
-                                
-                                if success:
-                                    await asyncio.sleep(3)
-                                else:
-                                    await asyncio.sleep(1)
-                        
-                        await asyncio.sleep(3)
-                    
-                    await asyncio.sleep(1)
-                
-                # ====== اسکنر پروکسی ======
-                if self.state.proxy_scanner_running:
-                    for channel in SOURCE_PROXY_CHANNELS:
-                        if not self.state.proxy_scanner_running:
-                            break
-                        
-                        logger.info(f"🔍 Scanning proxy: {channel}")
-                        msg, proxy_url = await self.scan_proxy_channel(channel)
-                        
-                        if proxy_url:
-                            proxy_hash = str(abs(hash(proxy_url)))
-                            if not await self.db.is_proxy_sent(proxy_hash):
-                                self.state.add_proxy_hash(proxy_hash)
-                                logger.info(f"✅ New proxy from {channel}")
-                                success = await self.send_proxy(proxy_url, channel)
-                                
-                                if success:
-                                    await asyncio.sleep(3)
-                                else:
-                                    await asyncio.sleep(1)
-                        
-                        await asyncio.sleep(3)
-                
                 # ====== اسکنر TXT (کانفنیگ‌های فایل) ======
                 if self.state.txt_scanner_running:
                     if not self._txt_sending:
@@ -1728,11 +1726,91 @@ class ChannelScanner:
                     if not self._github_sending:
                         asyncio.create_task(self.process_github_configs())
                 
-                if not self.state.config_scanner_running and not self.state.proxy_scanner_running and not self.state.txt_scanner_running and not self.state.github_scanner_running:
-                    await asyncio.sleep(5)
+                await asyncio.sleep(3)
                     
             except Exception as e:
                 logger.error(f"Scanner loop error: {e}")
+                await asyncio.sleep(5)
+
+    async def config_producer_loop(self):
+        """چنل‌های منبع کانفنیگ رو پشت‌سرهم و سریع اسکن می‌کنه و کانفنیگ‌های
+        جدید رو توی صف می‌ریزه (بدون معطلی برای ارسال - ارسال جدا و با
+        ریتم ثابت هر ۱۰ ثانیه انجام می‌شه)."""
+        logger.info(f"🔍 Config producer loop started ({len(SOURCE_CONFIG_CHANNELS)} channels)")
+        idx = 0
+        while True:
+            try:
+                if self.state.config_scanner_running and SOURCE_CONFIG_CHANNELS:
+                    channel = SOURCE_CONFIG_CHANNELS[idx % len(SOURCE_CONFIG_CHANNELS)]
+                    idx += 1
+                    msg, config_text = await self.scan_config_channel(channel)
+                    if config_text:
+                        config_hash = str(abs(hash(config_text.split('#')[0])))
+                        if not await self.db.is_config_sent(config_hash):
+                            await self._config_queue.put((config_text, channel))
+                            logger.info(f"➕ Config queued from {channel} (queue size: {self._config_queue.qsize()})")
+                    await asyncio.sleep(0.7)
+                else:
+                    await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Config producer error: {e}")
+                await asyncio.sleep(2)
+
+    async def config_sender_loop(self):
+        """دقیقاً هر ۱۰ ثانیه (حداقل) یک کانفنیگ از صف می‌فرسته."""
+        logger.info("📤 Config sender loop started (every 10s)")
+        while True:
+            try:
+                if self.state.config_scanner_running:
+                    try:
+                        config_text, channel = await asyncio.wait_for(self._config_queue.get(), timeout=2)
+                        self.state.add_config_hash(str(abs(hash(config_text.split('#')[0]))))
+                        logger.info(f"✅ Sending queued config from {channel}")
+                        await self.send_config(config_text, channel)
+                    except asyncio.TimeoutError:
+                        pass
+                await asyncio.sleep(10)
+            except Exception as e:
+                logger.error(f"Config sender error: {e}")
+                await asyncio.sleep(10)
+
+    async def proxy_producer_loop(self):
+        logger.info(f"🔍 Proxy producer loop started ({len(SOURCE_PROXY_CHANNELS)} channels)")
+        idx = 0
+        while True:
+            try:
+                if self.state.proxy_scanner_running and SOURCE_PROXY_CHANNELS:
+                    channel = SOURCE_PROXY_CHANNELS[idx % len(SOURCE_PROXY_CHANNELS)]
+                    idx += 1
+                    msg, proxy_url = await self.scan_proxy_channel(channel)
+                    if proxy_url:
+                        proxy_hash = str(abs(hash(proxy_url)))
+                        if not await self.db.is_proxy_sent(proxy_hash):
+                            await self._proxy_queue.put((proxy_url, channel))
+                            logger.info(f"➕ Proxy queued from {channel} (queue size: {self._proxy_queue.qsize()})")
+                    await asyncio.sleep(0.7)
+                else:
+                    await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Proxy producer error: {e}")
+                await asyncio.sleep(2)
+
+    async def proxy_sender_loop(self):
+        """سرعت پروکسی بیشتر از کانفنیگ - هر ۵ ثانیه یک پروکسی می‌فرسته."""
+        logger.info("📤 Proxy sender loop started (every 5s)")
+        while True:
+            try:
+                if self.state.proxy_scanner_running:
+                    try:
+                        proxy_url, channel = await asyncio.wait_for(self._proxy_queue.get(), timeout=2)
+                        self.state.add_proxy_hash(str(abs(hash(proxy_url))))
+                        logger.info(f"✅ Sending queued proxy from {channel}")
+                        await self.send_proxy(proxy_url, channel)
+                    except asyncio.TimeoutError:
+                        pass
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"Proxy sender error: {e}")
                 await asyncio.sleep(5)
     
     # ==================== مدیریت فایل TXT ====================
@@ -4283,18 +4361,19 @@ class ScannerBot:
             await message.reply_text("❌ لینک معتبر نیست. لطفاً یک لینک http/https ارسال کنید.")
             return
         
-        wait_msg = await message.reply_text("🔄 در حال دریافت و بررسی لینک...")
+        wait_msg = await message.reply_text("🔗 لینک دریافت شد.\n🔄 در حال دریافت و بررسی کانفنیگ‌ها...")
         
         result = await self.scanner.fetch_github_configs(url)
         
         if not result.get('ok'):
-            await wait_msg.edit_text(f"❌ خطا در دریافت لینک: {result.get('error', 'unknown')}")
+            await wait_msg.edit_text(f"🔗 لینک دریافت شد.\n❌ خطا در دریافت لینک: {result.get('error', 'unknown')}")
             return
         
         self.state.github_source_url = url
         
         await wait_msg.edit_text(
-            f"✅ {result['added']} کانفنیگ پیدا شد.\n\n"
+            f"🔗 لینک دریافت شد.\n"
+            f"✅ کانفنیگ ذخیره شد. ({result['added']} کانفنیگ پیدا شد)\n\n"
             f"🔄 تکراری: {result['duplicate']}\n"
             f"❌ نامعتبر: {result['invalid']}\n"
             f"📦 کل موارد داخل فایل: {result['total']}\n\n"
@@ -4897,6 +4976,16 @@ class ScannerBot:
             await self.ai_message_handler(update, context)
             return
         
+        # اگه ادمین (بدون زدن دکمه Send Link) مستقیم یه لینک http/https
+        # بفرسته و توی هیچ‌کدوم از حالت‌های بالا نبوده، به‌عنوان لینک
+        # منبع کانفنیگ GitHub در نظرش می‌گیریم تا دیگه "دستور نامعتبر"
+        # نده و به‌جاش "لینک دریافت شد" / "کانفنیگ ذخیره شد" بگه.
+        if text and self.state.is_admin(user_id):
+            stripped = text.strip()
+            if stripped.startswith("http://") or stripped.startswith("https://"):
+                await self.receive_github_link(update, context)
+                return
+        
         await message.reply_text(
             "❌ دستور نامعتبر!\n\nبرای مشاهده راهنما، دکمه /start را بزنید.",
             parse_mode=ParseMode.MARKDOWN
@@ -5285,10 +5374,13 @@ class ScannerBot:
         except Exception as e:
             logger.error(f"Error loading admins: {e}")
         
-        # بارگذاری وضعیت اسکنر (پیش‌فرض خاموش)
+        # بارگذاری وضعیت اسکنر
+        # نکته: طبق درخواست، اسکنر کانفنیگ و اسکنر GitHub همیشه در هر بار
+        # استارت ربات خاموش شروع می‌شن (صرف‌نظر از چیزی که قبلاً در دیتابیس
+        # ذخیره شده) - باید هر بار دستی از پنل ادمین روشن بشن.
         try:
-            config_state = await self.db.get_scanner_state("config_scanner")
-            self.state.config_scanner_running = config_state == "True"
+            self.state.config_scanner_running = False
+            await self.db.set_scanner_state("config_scanner", "False")
             
             proxy_state = await self.db.get_scanner_state("proxy_scanner")
             self.state.proxy_scanner_running = proxy_state == "True"
@@ -5296,10 +5388,10 @@ class ScannerBot:
             txt_state = await self.db.get_scanner_state("txt_scanner")
             self.state.txt_scanner_running = txt_state == "True"
             
-            github_state = await self.db.get_scanner_state("github_scanner")
-            self.state.github_scanner_running = github_state == "True"
+            self.state.github_scanner_running = False
+            await self.db.set_scanner_state("github_scanner", "False")
             
-            logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running}, Proxy: {self.state.proxy_scanner_running}, TXT: {self.state.txt_scanner_running}, GitHub: {self.state.github_scanner_running}")
+            logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running} (forced off), Proxy: {self.state.proxy_scanner_running}, TXT: {self.state.txt_scanner_running}, GitHub: {self.state.github_scanner_running} (forced off)")
         except Exception as e:
             logger.error(f"Error loading scanner states: {e}")
             self.state.config_scanner_running = False
@@ -5346,6 +5438,10 @@ class ScannerBot:
         
         # شروع تسک‌های پس‌زمینه
         asyncio.create_task(self.scanner.scanner_loop())
+        asyncio.create_task(self.scanner.config_producer_loop())
+        asyncio.create_task(self.scanner.config_sender_loop())
+        asyncio.create_task(self.scanner.proxy_producer_loop())
+        asyncio.create_task(self.scanner.proxy_sender_loop())
         asyncio.create_task(self.scanner.topic_forward_loop())
         asyncio.create_task(self.keep_alive())
         
