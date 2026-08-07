@@ -18,25 +18,11 @@ from dataclasses import dataclass, field
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import ChatAdminRequiredError, UserNotParticipantError, RPCError, FloodWaitError
-from telegram import InlineKeyboardButton as _BaseInlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
 from aiohttp import web
-
-# ==================== دکمه با پارامتر style (سازگاری) ====================
-# نکته مهم: تلگرام هیچ رنگی برای دکمه‌های inline پشتیبانی نمی‌کند (نه آبی،
-# نه قرمز، نه سبز) - این یک محدودیت خودِ پلتفرم تلگرامه، نه چیزی که با کد
-# بشه دورش زد. کتابخانه python-telegram-bot هم پارامتری به اسم style قبول
-# نمی‌کنه و پاس دادنش باعث TypeError می‌شد (همون "خطای الکی" که می‌دیدی -
-# کانفنیگ/لینک واقعاً ذخیره/پردازش می‌شد ولی ساخت دکمه‌ی جواب با کرش مواجه
-# می‌شد). این کلاس فقط style رو قبول و نادیده می‌گیره تا هم کد قبلی/جدید با
-# style="danger"/"success"/"primary" بدون کرش کار کنه، هم توی خود تلگرام
-# دکمه‌ها عادی (خاکستری) دیده بشن.
-class InlineKeyboardButton(_BaseInlineKeyboardButton):
-    def __init__(self, text, style=None, **kwargs):
-        super().__init__(text, **kwargs)
-
 
 # ==================== تنظیمات اصلی (جدید) ====================
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
@@ -57,34 +43,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ==================== ذخیره لاگ‌های اخیر برای دستور /logs ====================
-# همون خروجی‌ای که توی Railway (تب Logs) می‌بینی، از همین stdout ربات میاد؛
-# پس یه بافر حافظه‌ای نگه می‌داریم که دستور /logs از روش فیلتر کنه:
-# خطاها (ERROR/CRITICAL) + هر چیزی که مال ۱۰ دقیقه‌ی اخیره.
-class LogCapture(logging.Handler):
-    def __init__(self, maxlen: int = 3000):
+# ==================== بافر لاگ در حافظه (برای دستور /logs) ====================
+# چون به API ریلوی/توکن دسترسی نداریم، همان لاگ‌هایی که ریلوی از stdout این
+# پروسه می‌گیرد و در پنل Logs نشان می‌دهد، این‌جا هم در یک بافر حلقه‌ای در
+# حافظه نگه می‌داریم تا با دستور /logs مستقیماً از خود ربات قابل دریافت باشد.
+class InMemoryLogHandler(logging.Handler):
+    def __init__(self, capacity: int = 3000):
         super().__init__()
-        self.buffer = deque(maxlen=maxlen)
+        self.buffer = deque(maxlen=capacity)
 
     def emit(self, record):
         try:
-            self.buffer.append((datetime.now(), record.levelno, self.format(record)))
+            msg = self.format(record)
+            self.buffer.append({
+                'time': datetime.now(),
+                'level': record.levelname,
+                'message': msg
+            })
         except Exception:
             pass
 
-    def get_recent(self, minutes: int = 10):
-        cutoff = datetime.now() - timedelta(minutes=minutes)
-        result = []
-        for ts, levelno, line in self.buffer:
-            if levelno >= logging.ERROR or ts >= cutoff:
-                result.append(line)
-        return result
-
-
-log_capture = LogCapture()
-log_capture.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
-logging.getLogger().addHandler(log_capture)
+LOG_BUFFER_HANDLER = InMemoryLogHandler()
+LOG_BUFFER_HANDLER.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logging.getLogger().addHandler(LOG_BUFFER_HANDLER)
 
 # ==================== دیتابیس PostgreSQL ====================
 class Database:
@@ -843,44 +824,8 @@ PROXY_TOPIC_ID = 108613
 
 # ==================== لیست چنل‌های منبع ====================
 SOURCE_CONFIG_CHANNELS = [
-    "@SOSkeyNET",
-    "@Outline_Vpn",
-    "@V2All",
-    "@icv2ray",
-    "@appsooner",
-    "@V2ray_official",
-    "@meliproxyy",
-    "@mehrosaboran",
-    "@bored_vpn",
-    "@KAFING_2",
-    "@v2rayngzendegimamad",
-    "@Vpn_jet7",
-    "@oneclickvpnkeys",
-    "@filtershekan_channel",
-    "@V2raysCollector",
-    "@Vasl_b",
-    "@hi_proxy_iran",
-    "@proxy_kafee",
-    "@v2rayNplus",
-    "@HiByeVPNN",
-    "@Farah_VPN",
-    "@outline_ir",
-    "@FREECONFIGSPLUS",
-    "@on_proxy1",
-    "@NamazVPN",
-    "@FreeConfigForYou",
-    "@V2ngFast",
-    "@VPN_PASARGAD",
-    "@FreeOnlineVPN",
     "@FarazV2ray",
-    "@SheriffNet",
-    "@filembad",
-    "@PrivateVPNs",
-    "@chillguy_vpn",
-    "@free_conf_iran",
-    "@Shh_Proxy",
-    "@v2raydia",
-    "@Natrixo"
+    "@ConfigsHUB"
 ]
 
 SOURCE_PROXY_CHANNELS = [
@@ -942,7 +887,7 @@ class BotState:
     github_source_url: Optional[str] = None
     config_log_enabled: bool = False
     proxy_log_enabled: bool = False
-    send_to_topic_enabled: bool = False  # پیش‌فرض خاموش
+    send_to_topic_enabled: bool = False
     
     sent_config_hashes: Set[str] = field(default_factory=set)
     sent_proxy_hashes: Set[str] = field(default_factory=set)
@@ -977,7 +922,6 @@ class BotState:
     proxy_last_msg_id: Dict[str, int] = field(default_factory=dict)
     last_proxy_scan_time: datetime = field(default_factory=datetime.now)
     proxy_scan_retry_count: int = 0
-    last_topic_forward_ids: Dict[str, int] = field(default_factory=dict)  # برای فورارد هر ۱۰ ثانیه
     
     db: Optional[Database] = None
     
@@ -1093,69 +1037,53 @@ class ChannelScanner:
         self._txt_task = None
         self._github_sending = False
         self._github_task = None
-        self._config_queue = asyncio.Queue()
-        self._proxy_queue = asyncio.Queue()
     
-    def setup_live_forward(self):
-        """فورارد زنده: هر پیام جدیدی که در چنل v2reya88 ارسال شود،
-        بلافاصله دقیقاً داخل تاپیک هدف (CONFIG_TOPIC_ID) در گروه فورارد می‌شود.
-        این کار با همان کلاینت لاگین‌شده‌ی موجود (user_client) انجام می‌شود،
-        چون API_ID/API_HASH جدیدی که فرستادید بدون یک StringSession معتبر
-        (لاگین با شماره تلفن) قابل استفاده در سرور نیست."""
+    async def poll_forward_loop(self):
+        """فورارد بر اساس Polling (طبق درخواست شما): هر ۱۰ ثانیه یک‌بار آخرین
+        پیام چنل v2reya88 را می‌گیریم و اگر پیام جدیدی بود (که قبلاً فوروارد
+        نشده) دقیقاً به تاپیک هدف در گروه فوروارد می‌کنیم. این جایگزین روش
+        قبلی (event-محور) شد چون در عمل فوروارد نمی‌کرد."""
+        from telethon.tl.functions.channels import JoinChannelRequest
         
-        @self.user_client.on(events.NewMessage(chats=CHANNEL_1_USERNAME))
-        async def _live_forward_handler(event):
-            # اگه از پنل ادمین "ارسال به تاپیک" خاموش باشه، فورارد نمی‌کنیم
-            if not self.state.send_to_topic_enabled:
-                return
+        for username in (CHANNEL_1_USERNAME, CHANNEL_2_USERNAME):
             try:
-                await self.user_client.forward_messages(
-                    entity=GROUP_ID,
-                    messages=event.message.id,
-                    from_peer=event.chat_id,
-                    top_msg_id=CONFIG_TOPIC_ID
-                )
-                self.state.last_topic_forward_ids[CHANNEL_1_USERNAME] = event.message.id
-                logger.info(f"✅ Live-forwarded message {event.message.id} from {CHANNEL_1_USERNAME} to topic {CONFIG_TOPIC_ID}")
+                await self.user_client(JoinChannelRequest(username))
+                logger.info(f"✅ Joined/already member of @{username}")
             except Exception as e:
-                logger.error(f"Live forward error: {e}")
+                logger.error(f"⚠️ Could not join @{username}: {e} (اگر قبلاً عضو هستید این خطا مهم نیست)")
         
-        logger.info(f"👂 Live forwarder registered: {CHANNEL_1_USERNAME} -> topic {CONFIG_TOPIC_ID}")
-
-    async def topic_forward_loop(self):
-        """هر ۱۰ ثانیه، جدیدترین پیام چنل کانفنیگ (v2reya88) رو چک می‌کنه
-        و اگه فرق داشت با پیامی که قبلاً فورارد شده، به تاپیک کانفنیگ توی
-        گروه فورارد می‌کنه. طبق درخواست، فقط همین یک چنل فورارد می‌شه، نه
-        دو چنل. این یه لایه‌ی پشتیبان برای live-forward هست، چون بعضی
-        وقت‌ها event لحظه‌ای به هر دلیلی (قطعی موقت، ری‌کانکت و ...) از
-        دست می‌ره."""
-        logger.info("⏱️ Topic forward loop (هر ۱۰ ثانیه) شروع شد")
-        sources = [
-            (CHANNEL_1_USERNAME, CONFIG_TOPIC_ID),
-        ]
+        # بازیابی آخرین آیدی فوروارد شده از دیتابیس (برای اینکه بعد از ری‌استارت
+        # دوباره پیام‌های قدیمی را فوروارد نکند)
+        last_id_str = await self.db.get_scanner_state("last_forwarded_config_msg_id")
+        try:
+            last_forwarded_id = int(last_id_str) if last_id_str and last_id_str != "False" else 0
+        except ValueError:
+            last_forwarded_id = 0
+        
+        logger.info(f"👂 Poll-forwarder started for @{CHANNEL_1_USERNAME} -> topic {CONFIG_TOPIC_ID} (هر ۱۰ ثانیه)")
+        
         while True:
             try:
                 if self.state.send_to_topic_enabled:
-                    for channel_username, topic_id in sources:
-                        try:
-                            latest = await self.user_client.get_messages(channel_username, limit=1)
-                            if not latest:
-                                continue
-                            latest_msg = latest[0]
-                            last_id = self.state.last_topic_forward_ids.get(channel_username)
-                            if latest_msg.id != last_id:
+                    messages = await self.user_client.get_messages(CHANNEL_1_USERNAME, limit=1)
+                    if messages:
+                        latest = messages[0]
+                        if latest.id > last_forwarded_id:
+                            try:
                                 await self.user_client.forward_messages(
                                     entity=GROUP_ID,
-                                    messages=latest_msg.id,
-                                    from_peer=channel_username,
-                                    top_msg_id=topic_id
+                                    messages=latest.id,
+                                    from_peer=CHANNEL_1_USERNAME,
+                                    top_msg_id=CONFIG_TOPIC_ID
                                 )
-                                self.state.last_topic_forward_ids[channel_username] = latest_msg.id
-                                logger.info(f"✅ (10s-loop) Forwarded {latest_msg.id} from {channel_username} to topic {topic_id}")
-                        except Exception as e:
-                            logger.error(f"Topic forward loop error ({channel_username}): {e}")
+                                logger.info(f"✅ Poll-forwarded message {latest.id} from @{CHANNEL_1_USERNAME} to topic {CONFIG_TOPIC_ID}")
+                            except Exception as fwd_err:
+                                logger.error(f"❌ Poll forward error: {fwd_err}")
+                            last_forwarded_id = latest.id
+                            await self.db.set_scanner_state("last_forwarded_config_msg_id", str(last_forwarded_id))
             except Exception as e:
-                logger.error(f"Topic forward loop fatal error: {e}")
+                logger.error(f"❌ Poll-forward loop error: {e}")
+            
             await asyncio.sleep(10)
     
     async def check_flood_wait(self) -> Tuple[bool, int]:
@@ -1208,22 +1136,70 @@ class ChannelScanner:
         return True
     
     async def extract_host(self, config_text: str) -> Optional[str]:
-        m = re.search(r'@([^:]+):(\d+)', config_text)
+        """آدرس واقعی سرور را از داخل کانفنیگ استخراج می‌کند تا لوکیشن واقعی
+        (نه لوکیشن سرور خود ربات) نمایش داده شود. برای vmess حتماً باید
+        base64 دیکد شود چون آدرس داخل JSON است، نه در متن خام لینک."""
+        try:
+            if config_text.startswith('vmess://'):
+                import base64
+                raw = config_text[len('vmess://'):].split('#')[0].strip()
+                raw += '=' * (-len(raw) % 4)
+                decoded = base64.b64decode(raw).decode('utf-8', errors='ignore')
+                data = json.loads(decoded)
+                addr = data.get('add') or data.get('address')
+                if addr:
+                    return addr.strip()
+        except Exception as e:
+            logger.error(f"extract_host vmess decode error: {e}")
+        
+        # vless / trojan / ss / hy2: معمولاً به شکل user@host:port یا host:port هستند
+        m = re.search(r'@([^:/?#@]+):(\d+)', config_text)
         if m:
             return m.group(1)
-        m = re.search(r'host=([^&]+)', config_text)
+        
+        m = re.search(r'[?&]host=([^&\s]+)', config_text)
+        if m:
+            return urllib.parse.unquote(m.group(1))
+        
+        m = re.search(r'([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):(\d+)', config_text)
         if m:
             return m.group(1)
-        m = re.search(r'([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):(\d+)', config_text)
-        if m:
-            return m.group(1)
+        
+        # ss:// بعضاً به‌صورت کامل base64 است: ss://BASE64@host:port یا ss://BASE64
+        if config_text.startswith('ss://'):
+            try:
+                import base64
+                body = config_text[len('ss://'):].split('#')[0]
+                if '@' not in body:
+                    raw = body.strip()
+                    raw += '=' * (-len(raw) % 4)
+                    decoded = base64.b64decode(raw).decode('utf-8', errors='ignore')
+                    m2 = re.search(r'@([^:/?#@]+):(\d+)', decoded)
+                    if m2:
+                        return m2.group(1)
+            except Exception as e:
+                logger.error(f"extract_host ss decode error: {e}")
+        
         return None
     
-    async def get_ip_info(self, ip: Optional[str] = None) -> Dict[str, str]:
+    def extract_proxy_host(self, proxy_url: str) -> Optional[str]:
+        """آدرس واقعی سرور پروکسی (نه IP خود ربات) را از لینک t.me/proxy استخراج می‌کند."""
+        m = re.search(r'[?&]server=([^&\s]+)', proxy_url)
+        if m:
+            return urllib.parse.unquote(m.group(1))
+        return None
+    
+    async def get_ip_info(self, ip: Optional[str] = None, allow_self_lookup: bool = False) -> Dict[str, str]:
+        """اطلاعات لوکیشن یک IP/دامنه مشخص را برمی‌گرداند. اگر ip داده نشود و
+        allow_self_lookup=False باشد (پیش‌فرض)، به‌جای گرفتن لوکیشن IP خود
+        سرور ربات (که باعث نمایش لوکیشن غلط/فیک برای کانفنیگ‌ها می‌شد)،
+        مستقیماً Unknown برمی‌گردد."""
+        if not ip and not allow_self_lookup:
+            return {'ip': 'Unknown', 'country': 'Unknown', 'countryCode': '', 'city': 'Unknown', 'region': 'Unknown', 'isp': 'Unknown'}
         try:
             url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,isp,query" if ip else "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,isp,query"
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=5) as response:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as response:
                     if response.status == 200:
                         data = await response.json()
                         if data.get('status') == 'success':
@@ -1235,8 +1211,10 @@ class ChannelScanner:
                                 'region': data.get('regionName', 'Unknown'),
                                 'isp': data.get('isp', 'Unknown')
                             }
-        except:
-            pass
+                        else:
+                            logger.error(f"ip-api lookup failed for '{ip}': {data.get('message', data)}")
+        except Exception as e:
+            logger.error(f"get_ip_info error for '{ip}': {e}")
         return {'ip': ip or 'Unknown', 'country': 'Unknown', 'countryCode': '', 'city': 'Unknown', 'region': 'Unknown', 'isp': 'Unknown'}
     
     def get_country_flag(self, country_code: str) -> str:
@@ -1466,15 +1444,19 @@ class ChannelScanner:
             else:
                 config_text = config_text + '#@v2reya88%20%7C%20%40confinghub2'
             
-            # از HTML به‌جای Markdown استفاده می‌کنیم چون کانفنیگ‌ها معمولاً شامل
-            # کاراکترهای _ * ` هستند که پارسر Markdown قدیمی را می‌شکند و باعث
-            # می‌شد پیام ناقص/نصفه ارسال یا کلاً رد شود. با escape کردن در HTML
-            # این مشکل کامل حل می‌شود.
-            safe_config_text = html.escape(config_text)
-            message = f"""<code>{safe_config_text}</code>
+            # طبق درخواست شما: کانفنیگ داخل یک بلاک کد واقعی با سه‌تا بک‌کوتیشن
+            # (```) قرار می‌گیرد - دقیقاً همون شکلی که قبلاً بود. تنها چیزی که
+            # ایمن‌سازی می‌کنیم، بک‌کوتیشن‌های احتمالی داخل خودِ کانفنیگ است
+            # (تا فنس کد بلاک به‌اشتباه زودتر از موعد بسته نشود)؛ زیرا داخل
+            # یک بلاک کد، تلگرام هیچ نشانه‌ی مارک‌داون دیگری (_ * و...) را
+            # پردازش نمی‌کند، پس مشکل قبلیِ نصفه‌ارسالی از این مسیر رخ نمی‌دهد.
+            safe_config_text = config_text.replace('`', "'")
+            message = f"""```
+{safe_config_text}
+```
 
-📍 Location: {flag} {html.escape(location.get('country', 'Unknown'))}
-🏙️ City: {html.escape(location.get('city', 'Unknown'))}
+📍 Location: {flag} {location.get('country', 'Unknown')}
+🏙️ City: {location.get('city', 'Unknown')}
 
 @v2reya88 | @confinghub2"""
             
@@ -1488,30 +1470,32 @@ class ChannelScanner:
                 ]
             ])
             
-            sent_msg = await self.bot_app.bot.send_message(
-                chat_id=CONFIG_TARGET_CHANNEL,
-                text=message,
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard
-            )
+            try:
+                sent_msg = await self.bot_app.bot.send_message(
+                    chat_id=CONFIG_TARGET_CHANNEL,
+                    text=message,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard
+                )
+            except Exception as parse_err:
+                # اگر به هر دلیلی مارک‌داون رد شد (مثلاً کاراکتر غیرمنتظره)،
+                # پیام را بدون فرمت ارسال می‌کنیم تا حداقل کانفنیگ گم نشود -
+                # به‌جای اینکه کل ارسال بی‌صدا شکست بخورد.
+                logger.error(f"Markdown send failed, retrying as plain text: {parse_err}")
+                sent_msg = await self.bot_app.bot.send_message(
+                    chat_id=CONFIG_TARGET_CHANNEL,
+                    text=message.replace('```', ''),
+                    reply_markup=keyboard
+                )
             logger.info(f"✅ Config sent to channel: {CONFIG_TARGET_CHANNEL}")
             
-            sent_to_topic = False
-            
-            if self.state.send_to_topic_enabled and self.is_valid_config(config_text):
-                try:
-                    # top_msg_id ضروری است تا پیام دقیقاً داخل همان تاپیک هدف
-                    # ارسال شود، نه در تاپیک عمومی گروه.
-                    await self.user_client.forward_messages(
-                        entity=GROUP_ID,
-                        messages=sent_msg.message_id,
-                        from_peer=CONFIG_TARGET_CHANNEL,
-                        top_msg_id=CONFIG_TOPIC_ID
-                    )
-                    sent_to_topic = True
-                    logger.info(f"✅ Config forwarded to topic")
-                except Exception as e:
-                    logger.error(f"Forward to topic error: {e}")
+            # فوروارد واقعی این‌جا انجام نمی‌شود - چون بلافاصله بعد از
+            # ارسال، رویداد NewMessage در setup_live_forward پیام را
+            # می‌گیرد و اگر «ارسال به تاپیک» روشن باشد، خودش فوروارد
+            # می‌کند. اینطوری فقط یک مسیر فوروارد داریم (بدون تکرار) و
+            # مشکل «سایلنت فیل شدن» کلاینت دوم روی پیام کلاینت اول هم
+            # از بین می‌رود.
+            sent_to_topic = self.state.send_to_topic_enabled
             
             await self.db.add_sent_config(
                 config_text=config_text,
@@ -1530,7 +1514,8 @@ class ChannelScanner:
     
     async def send_proxy(self, proxy_url: str, source_channel: str = None) -> bool:
         try:
-            info = await self.get_ip_info()
+            proxy_host = self.extract_proxy_host(proxy_url)
+            info = await self.get_ip_info(proxy_host)
             flag = self.get_country_flag(info.get('countryCode', ''))
             
             proxy_hash = str(abs(hash(proxy_url)))
@@ -1539,17 +1524,15 @@ class ChannelScanner:
                 logger.info(f"⏭️ Proxy already sent: {proxy_hash[:10]}...")
                 return True
             
-            safe_proxy_url = html.escape(proxy_url)
-            channel_message = f"""<code>{safe_proxy_url}</code>
+            channel_message = f"""now proxy ⚡️
 
-now proxy ⚡️
 📍 Location: {flag} {html.escape(info.get('country', 'Unknown'))}
 
 @v2reya88 | @confinghub2"""
             
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("CONNECT", url=proxy_url, style="danger"),
+                    InlineKeyboardButton("CONNECT", url=proxy_url, style="primary"),
                     InlineKeyboardButton("CHANNEL", url=CHANNEL_2_LINK, style="danger")
                 ],
                 [
@@ -1565,20 +1548,9 @@ now proxy ⚡️
             )
             logger.info(f"✅ Proxy sent to channel: {PROXY_TARGET_CHANNEL}")
             
-            sent_to_topic = False
-            
-            if self.state.send_to_topic_enabled:
-                try:
-                    await self.user_client.forward_messages(
-                        entity=GROUP_ID,
-                        messages=sent_msg.message_id,
-                        from_peer=PROXY_TARGET_CHANNEL,
-                        top_msg_id=PROXY_TOPIC_ID
-                    )
-                    sent_to_topic = True
-                    logger.info(f"✅ Proxy forwarded to topic")
-                except Exception as e:
-                    logger.error(f"Forward to topic error: {e}")
+            # همان‌طور که در send_config توضیح داده شد، فوروارد واقعی
+            # توسط شنوندهٔ زنده در setup_live_forward انجام می‌شود.
+            sent_to_topic = self.state.send_to_topic_enabled
             
             await self.db.add_sent_proxy(
                 proxy_url=proxy_url,
@@ -1706,111 +1678,79 @@ now proxy ⚡️
             logger.info("🐙 GitHub configs sender stopped.")
     
     async def scanner_loop(self):
-        """این لوپ فقط مسئول تریگر زدن اسکنر TXT و GitHub هست.
-        اسکن/ارسال کانفنیگ و پروکسی به دو جفت لوپ producer/consumer
-        جدا منتقل شده (config_producer_loop + config_sender_loop و
-        proxy_producer_loop + proxy_sender_loop) تا سرعت پیدا کردن از
-        سرعت ارسال جدا باشه و بشه گارانتی کرد حداقل هر ۱۰ ثانیه یک
-        کانفنیگ ارسال میشه."""
-        logger.info("🔄 Scanner loop (TXT/GitHub triggers) started...")
+        logger.info("🔄 Scanner loop started (Every 3 seconds)...")
         
         while True:
             try:
+                # ====== اسکنر کانفنیگ از چنل‌ها ======
+                if self.state.config_scanner_running:
+                    for channel in SOURCE_CONFIG_CHANNELS:
+                        if not self.state.config_scanner_running:
+                            break
+                        
+                        logger.info(f"🔍 Scanning config: {channel}")
+                        msg, config_text = await self.scan_config_channel(channel)
+                        
+                        if config_text:
+                            config_hash = str(abs(hash(config_text.split('#')[0])))
+                            if not await self.db.is_config_sent(config_hash):
+                                self.state.add_config_hash(config_hash)
+                                logger.info(f"✅ New config from {channel}")
+                                success = await self.send_config(config_text, channel)
+                                
+                                if success:
+                                    await asyncio.sleep(3)
+                                else:
+                                    await asyncio.sleep(1)
+                        
+                        await asyncio.sleep(3)
+                    
+                    await asyncio.sleep(1)
+                
+                # ====== اسکنر پروکسی ======
+                if self.state.proxy_scanner_running:
+                    for channel in SOURCE_PROXY_CHANNELS:
+                        if not self.state.proxy_scanner_running:
+                            break
+                        
+                        logger.info(f"🔍 Scanning proxy: {channel}")
+                        msg, proxy_url = await self.scan_proxy_channel(channel)
+                        
+                        if proxy_url:
+                            proxy_hash = str(abs(hash(proxy_url)))
+                            if not await self.db.is_proxy_sent(proxy_hash):
+                                self.state.add_proxy_hash(proxy_hash)
+                                logger.info(f"✅ New proxy from {channel}")
+                                success = await self.send_proxy(proxy_url, channel)
+                                
+                                if success:
+                                    await asyncio.sleep(3)
+                                else:
+                                    await asyncio.sleep(1)
+                        
+                        await asyncio.sleep(3)
+                
                 # ====== اسکنر TXT (کانفنیگ‌های فایل) ======
                 if self.state.txt_scanner_running:
                     if not self._txt_sending:
+                        # فلگ را همین‌جا و به‌صورت سینک روشن می‌کنیم تا در
+                        # چرخهٔ بعدی حلقه (که ممکن است قبل از اجرای واقعی
+                        # تسک پیش بیاید) دوباره تسک ساخته نشود.
+                        self._txt_sending = True
                         asyncio.create_task(self.process_txt_configs())
                 
                 # ====== اسکنر GitHub - مستقل، کنار اسکنر واقعی ======
                 if self.state.github_scanner_running:
                     if not self._github_sending:
+                        self._github_sending = True
                         asyncio.create_task(self.process_github_configs())
                 
-                await asyncio.sleep(3)
+                # همیشه یک مکث کوچک - جلوگیری از حلقهٔ بدون‌مکث (busy-loop)
+                # وقتی فقط txt یا github فعال‌اند و config/proxy خاموش‌اند
+                await asyncio.sleep(1)
                     
             except Exception as e:
                 logger.error(f"Scanner loop error: {e}")
-                await asyncio.sleep(5)
-
-    async def config_producer_loop(self):
-        """چنل‌های منبع کانفنیگ رو پشت‌سرهم و سریع اسکن می‌کنه و کانفنیگ‌های
-        جدید رو توی صف می‌ریزه (بدون معطلی برای ارسال - ارسال جدا و با
-        ریتم ثابت هر ۱۰ ثانیه انجام می‌شه)."""
-        logger.info(f"🔍 Config producer loop started ({len(SOURCE_CONFIG_CHANNELS)} channels)")
-        idx = 0
-        while True:
-            try:
-                if self.state.config_scanner_running and SOURCE_CONFIG_CHANNELS:
-                    channel = SOURCE_CONFIG_CHANNELS[idx % len(SOURCE_CONFIG_CHANNELS)]
-                    idx += 1
-                    msg, config_text = await self.scan_config_channel(channel)
-                    if config_text:
-                        config_hash = str(abs(hash(config_text.split('#')[0])))
-                        if not await self.db.is_config_sent(config_hash):
-                            await self._config_queue.put((config_text, channel))
-                            logger.info(f"➕ Config queued from {channel} (queue size: {self._config_queue.qsize()})")
-                    await asyncio.sleep(0.7)
-                else:
-                    await asyncio.sleep(2)
-            except Exception as e:
-                logger.error(f"Config producer error: {e}")
-                await asyncio.sleep(2)
-
-    async def config_sender_loop(self):
-        """دقیقاً هر ۱۰ ثانیه (حداقل) یک کانفنیگ از صف می‌فرسته."""
-        logger.info("📤 Config sender loop started (every 10s)")
-        while True:
-            try:
-                if self.state.config_scanner_running:
-                    try:
-                        config_text, channel = await asyncio.wait_for(self._config_queue.get(), timeout=2)
-                        self.state.add_config_hash(str(abs(hash(config_text.split('#')[0]))))
-                        logger.info(f"✅ Sending queued config from {channel}")
-                        await self.send_config(config_text, channel)
-                    except asyncio.TimeoutError:
-                        pass
-                await asyncio.sleep(10)
-            except Exception as e:
-                logger.error(f"Config sender error: {e}")
-                await asyncio.sleep(10)
-
-    async def proxy_producer_loop(self):
-        logger.info(f"🔍 Proxy producer loop started ({len(SOURCE_PROXY_CHANNELS)} channels)")
-        idx = 0
-        while True:
-            try:
-                if self.state.proxy_scanner_running and SOURCE_PROXY_CHANNELS:
-                    channel = SOURCE_PROXY_CHANNELS[idx % len(SOURCE_PROXY_CHANNELS)]
-                    idx += 1
-                    msg, proxy_url = await self.scan_proxy_channel(channel)
-                    if proxy_url:
-                        proxy_hash = str(abs(hash(proxy_url)))
-                        if not await self.db.is_proxy_sent(proxy_hash):
-                            await self._proxy_queue.put((proxy_url, channel))
-                            logger.info(f"➕ Proxy queued from {channel} (queue size: {self._proxy_queue.qsize()})")
-                    await asyncio.sleep(0.7)
-                else:
-                    await asyncio.sleep(2)
-            except Exception as e:
-                logger.error(f"Proxy producer error: {e}")
-                await asyncio.sleep(2)
-
-    async def proxy_sender_loop(self):
-        """سرعت پروکسی بیشتر از کانفنیگ - هر ۵ ثانیه یک پروکسی می‌فرسته."""
-        logger.info("📤 Proxy sender loop started (every 5s)")
-        while True:
-            try:
-                if self.state.proxy_scanner_running:
-                    try:
-                        proxy_url, channel = await asyncio.wait_for(self._proxy_queue.get(), timeout=2)
-                        self.state.add_proxy_hash(str(abs(hash(proxy_url))))
-                        logger.info(f"✅ Sending queued proxy from {channel}")
-                        await self.send_proxy(proxy_url, channel)
-                    except asyncio.TimeoutError:
-                        pass
-                await asyncio.sleep(5)
-            except Exception as e:
-                logger.error(f"Proxy sender error: {e}")
                 await asyncio.sleep(5)
     
     # ==================== مدیریت فایل TXT ====================
@@ -1935,7 +1875,7 @@ class ScannerBot:
     def membership_buttons(self):
         return InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("چنل کانفنیگ", url=CHANNEL_1_LINK, style="primary"),
+                InlineKeyboardButton("چنل کانفنیگ", url=CHANNEL_1_LINK, style="danger"),
                 InlineKeyboardButton("چنل پروکسی", url=CHANNEL_2_LINK, style="danger")
             ],
             [
@@ -2029,7 +1969,8 @@ class ScannerBot:
         ])
     
     def admin_panel_buttons(self, page: int = 1):
-        # صفحه ۱: کنترل‌های اصلی و پرکاربرد
+        """پنل ادمین در دو صفحه. صفحه ۱: گزینه‌های اصلی/قدیمی.
+        صفحه ۲: گزینه‌های جدید (فعلاً فقط GitHub) + دکمه‌های Next/Back."""
         if page == 1:
             return InlineKeyboardMarkup([
                 [
@@ -2049,39 +1990,33 @@ class ScannerBot:
                 ],
                 [
                     InlineKeyboardButton("لیست ادمین‌ها", callback_data="admin_list", style="danger"),
-                    InlineKeyboardButton("بن/آنبن", callback_data="admin_ban_menu", style="danger")
+                    InlineKeyboardButton("بن/آنبن", callback_data="admin_ban_menu", style="danger"),
+                    InlineKeyboardButton("لاگ‌ها", callback_data="admin_log_menu", style="danger")
                 ],
                 [
-                    InlineKeyboardButton("➡️ بعدی", callback_data="admin_page_2", style="primary")
+                    InlineKeyboardButton("لیست خریدهای موفق", callback_data="admin_successful_orders", style="success"),
+                    InlineKeyboardButton("لیست گزارشات", callback_data="admin_report_list", style="success"),
+                    InlineKeyboardButton("ارسال به تاپیک", callback_data="admin_topic", style="success")
                 ],
                 [
-                    InlineKeyboardButton("بازگشت", callback_data="back_main", style="success")
+                    InlineKeyboardButton("درخواست‌های ردیم کد", callback_data="admin_redeem_requests", style="primary"),
+                    InlineKeyboardButton("پاسخ مجدد به گزارش", callback_data="admin_reply_again", style="primary")
+                ],
+                [
+                    InlineKeyboardButton("➡️ صفحه بعد", callback_data="admin_panel_page_2", style="primary"),
+                    InlineKeyboardButton("بازگشت", callback_data="back_main", style="danger")
                 ]
             ])
-        # صفحه ۲: گزینه‌های تکمیلی (لاگ، فورارد به تاپیک، گیت‌هاب و ...)
-        return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("لاگ‌ها", callback_data="admin_log_menu", style="danger"),
-                InlineKeyboardButton("ارسال به تاپیک", callback_data="admin_topic", style="success")
-            ],
-            [
-                InlineKeyboardButton("لیست خریدهای موفق", callback_data="admin_successful_orders", style="success"),
-                InlineKeyboardButton("لیست گزارشات", callback_data="admin_report_list", style="success")
-            ],
-            [
-                InlineKeyboardButton("درخواست‌های ردیم کد", callback_data="admin_redeem_requests", style="primary"),
-                InlineKeyboardButton("پاسخ مجدد به گزارش", callback_data="admin_reply_again", style="primary")
-            ],
-            [
-                InlineKeyboardButton("GitHub", callback_data="admin_github", style="danger")
-            ],
-            [
-                InlineKeyboardButton("⬅️ قبلی", callback_data="admin_page_1", style="primary")
-            ],
-            [
-                InlineKeyboardButton("بازگشت", callback_data="back_main", style="success")
-            ]
-        ])
+        else:
+            return InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("GitHub", callback_data="admin_github", style="danger")
+                ],
+                [
+                    InlineKeyboardButton("⬅️ صفحه قبل", callback_data="admin_panel_page_1", style="primary"),
+                    InlineKeyboardButton("بازگشت", callback_data="back_main", style="danger")
+                ]
+            ])
     
     def admin_orders_buttons(self):
         return InlineKeyboardMarkup([
@@ -2131,7 +2066,7 @@ class ScannerBot:
                 InlineKeyboardButton("Send Link", callback_data="github_link")
             ],
             [
-                InlineKeyboardButton("Back", callback_data="back_to_admin", style="primary")
+                InlineKeyboardButton("Back", callback_data="admin_panel_page_2", style="primary")
             ]
         ])
     
@@ -2578,7 +2513,8 @@ class ScannerBot:
             return
         
         self.state.send_to_topic_enabled = True
-        await query.answer("✅ ارسال به تاپیک روشن شد!")
+        await self.db.set_scanner_state("send_to_topic", "True")
+        await query.answer("✅ ارسال به تاپیک (فوروارد) روشن شد!")
         await self.admin_topic_panel(update, context)
     
     async def topic_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2590,7 +2526,8 @@ class ScannerBot:
             return
         
         self.state.send_to_topic_enabled = False
-        await query.answer("🔴 ارسال به تاپیک خاموش شد!")
+        await self.db.set_scanner_state("send_to_topic", "False")
+        await query.answer("🔴 ارسال به تاپیک (فوروارد) خاموش شد!")
         await self.admin_topic_panel(update, context)
     
     # ==================== مدیریت کانفنیگ TXT ====================
@@ -4230,6 +4167,46 @@ class ScannerBot:
             logger.error(f"   {traceback.format_exc()}")
             await update.message.reply_text("❌ خطا در اجرای دستور! لطفاً دوباره تلاش کنید.")
     
+    async def logs_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور /logs - همه لاگ‌های خطادار یا مربوط به ۱۰ دقیقه اخیر را می‌فرستد.
+        این لاگ‌ها همان چیزی هستند که در تب Logs ریلوی هم دیده می‌شوند، چون
+        همه از stdout همین پروسه گرفته می‌شوند - فقط بدون نیاز به توکن API ریلوی."""
+        user_id = update.effective_user.id
+        message = update.message
+        
+        if not self.state.is_admin(user_id):
+            await message.reply_text("❌ فقط ادمین‌ها به این دستور دسترسی دارند.")
+            return
+        
+        now = datetime.now()
+        window_minutes = 10
+        cutoff = now - timedelta(minutes=window_minutes)
+        
+        entries = [
+            e for e in list(LOG_BUFFER_HANDLER.buffer)
+            if e['level'] in ('ERROR', 'CRITICAL') or e['time'] >= cutoff
+        ]
+        
+        if not entries:
+            await message.reply_text(
+                f"✅ در {window_minutes} دقیقهٔ اخیر هیچ خطایی ثبت نشده و لاگ دیگری هم موجود نیست."
+            )
+            return
+        
+        text_lines = [e['message'] for e in entries]
+        full_text = "\n".join(text_lines)
+        
+        error_count = sum(1 for e in entries if e['level'] in ('ERROR', 'CRITICAL'))
+        header = f"📄 لاگ‌ها ({len(entries)} خط - {error_count} خطا - {window_minutes} دقیقهٔ اخیر)\n\n"
+        
+        # اگر متن کوتاه بود مستقیم بفرست، وگرنه به‌صورت فایل (تا تلگرام آن را قطع نکند)
+        if len(header) + len(full_text) <= 3800:
+            await message.reply_text(header + full_text)
+        else:
+            buf = io.BytesIO((header + full_text).encode('utf-8'))
+            buf.name = f"logs_{now.strftime('%Y%m%d_%H%M%S')}.txt"
+            await message.reply_document(document=buf, filename=buf.name, caption=header[:1000])
+    
     async def admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
         query = update.callback_query
         user_id = query.from_user.id
@@ -4361,19 +4338,18 @@ class ScannerBot:
             await message.reply_text("❌ لینک معتبر نیست. لطفاً یک لینک http/https ارسال کنید.")
             return
         
-        wait_msg = await message.reply_text("🔗 لینک دریافت شد.\n🔄 در حال دریافت و بررسی کانفنیگ‌ها...")
+        wait_msg = await message.reply_text("🔄 در حال دریافت و بررسی لینک...")
         
         result = await self.scanner.fetch_github_configs(url)
         
         if not result.get('ok'):
-            await wait_msg.edit_text(f"🔗 لینک دریافت شد.\n❌ خطا در دریافت لینک: {result.get('error', 'unknown')}")
+            await wait_msg.edit_text(f"❌ خطا در دریافت لینک: {result.get('error', 'unknown')}")
             return
         
         self.state.github_source_url = url
         
         await wait_msg.edit_text(
-            f"🔗 لینک دریافت شد.\n"
-            f"✅ کانفنیگ ذخیره شد. ({result['added']} کانفنیگ پیدا شد)\n\n"
+            f"✅ {result['added']} کانفنیگ پیدا شد.\n\n"
             f"🔄 تکراری: {result['duplicate']}\n"
             f"❌ نامعتبر: {result['invalid']}\n"
             f"📦 کل موارد داخل فایل: {result['total']}\n\n"
@@ -4656,43 +4632,13 @@ class ScannerBot:
         await query.answer()
         await query.edit_message_text(
             "📋 **مدیریت لاگ‌ها**\n\n"
-            "با دستور /logs یا دکمه‌ی زیر، آخرین لاگ‌های خطا و لاگ‌های ۱۰ "
-            "دقیقه‌ی اخیر ربات (همون چیزی که توی Railway هم می‌بینی) رو "
-            "همین‌جا دریافت کن.",
+            "لاگ‌ها در Railway قابل مشاهده هستند.\n"
+            "برای مشاهده لاگ‌ها به پنل Railway بروید.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📄 دریافت لاگ‌های اخیر", callback_data="admin_get_logs", style="primary")],
                 [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="danger")]
             ])
         )
-
-    async def send_recent_logs(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        """لاگ‌های خطا + لاگ‌های ۵ تا ۱۰ دقیقه‌ی اخیر رو به صورت بلاک کد می‌فرسته."""
-        lines = log_capture.get_recent(minutes=10)
-        if not lines:
-            await context.bot.send_message(chat_id=chat_id, text="✅ هیچ لاگ خطا یا لاگ اخیری پیدا نشد.")
-            return
-
-        text = "\n".join(lines)
-        chunk_size = 3500
-        chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)] or [""]
-
-        for i, chunk in enumerate(chunks):
-            header = f"📋 لاگ‌های اخیر ({i + 1}/{len(chunks)}):\n" if len(chunks) > 1 else "📋 لاگ‌های اخیر:\n"
-            safe_chunk = html.escape(chunk)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"{header}<pre>{safe_chunk}</pre>",
-                parse_mode=ParseMode.HTML
-            )
-
-    async def logs_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """دستور /logs - فقط برای ادمین‌ها"""
-        user_id = update.effective_user.id
-        if not self.state.is_admin(user_id):
-            await update.message.reply_text("فقط ادمین‌ها دسترسی دارند.")
-            return
-        await self.send_recent_logs(update.effective_chat.id, context)
     
     # ==================== راهنما ====================
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4774,22 +4720,34 @@ class ScannerBot:
     
     # ==================== Error Handler ====================
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """مدیریت خطاها با لاگ دقیق"""
+        """مدیریت خطاها با لاگ دقیق. برای ادمین‌ها متن واقعی خطا نمایش داده
+        می‌شود (نه یک پیام کلی مبهم) تا دیباگ سریع‌تر انجام شود؛ همینطور
+        خطاهای بی‌اهمیت مثل «Message is not modified» اصلاً به کاربر نشان
+        داده نمی‌شوند چون واقعاً خطا نیستند."""
         error = context.error
+        error_str = str(error)
         logger.error(f"❌ Exception: {error}")
         logger.error(f"   Type: {type(error)}")
         
         import traceback
-        logger.error(f"   Traceback: {traceback.format_exc()}")
+        tb_text = traceback.format_exc()
+        logger.error(f"   Traceback: {tb_text}")
+        
+        # این خطاها بی‌ضررند و نباید چیزی به کاربر نشان داده شود
+        harmless_markers = ["message is not modified", "flood", "floodwait", "query is too old", "message to edit not found"]
+        if any(m in error_str.lower() for m in harmless_markers):
+            return
         
         if update and hasattr(update, 'effective_chat') and update.effective_chat:
             try:
-                if "FloodWait" not in str(error) and "flood" not in str(error).lower():
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text="❌ خطایی رخ داد! لطفاً دوباره امتحان کنید."
-                    )
-            except:
+                chat_id = update.effective_chat.id
+                if self.state.is_admin(chat_id):
+                    short_tb = tb_text.strip().split('\n')[-1]
+                    text = f"❌ خطا (فقط برای دیباگ ادمین):\n\n{type(error).__name__}: {error_str[:500]}\n\n{short_tb[:300]}\n\nبرای جزئیات بیشتر /logs بزنید."
+                else:
+                    text = "❌ خطایی رخ داد! لطفاً دوباره امتحان کنید."
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            except Exception:
                 pass
     
     # ==================== Message Handler ====================
@@ -4975,16 +4933,6 @@ class ScannerBot:
         if text and context.user_data.get('ai_mode'):
             await self.ai_message_handler(update, context)
             return
-        
-        # اگه ادمین (بدون زدن دکمه Send Link) مستقیم یه لینک http/https
-        # بفرسته و توی هیچ‌کدوم از حالت‌های بالا نبوده، به‌عنوان لینک
-        # منبع کانفنیگ GitHub در نظرش می‌گیریم تا دیگه "دستور نامعتبر"
-        # نده و به‌جاش "لینک دریافت شد" / "کانفنیگ ذخیره شد" بگه.
-        if text and self.state.is_admin(user_id):
-            stripped = text.strip()
-            if stripped.startswith("http://") or stripped.startswith("https://"):
-                await self.receive_github_link(update, context)
-                return
         
         await message.reply_text(
             "❌ دستور نامعتبر!\n\nبرای مشاهده راهنما، دکمه /start را بزنید.",
@@ -5207,10 +5155,10 @@ class ScannerBot:
             if data == "admin_panel":
                 await self.admin_panel(update, context, page=1)
                 return
-            if data == "admin_page_1":
+            if data == "admin_panel_page_1":
                 await self.admin_panel(update, context, page=1)
                 return
-            if data == "admin_page_2":
+            if data == "admin_panel_page_2":
                 await self.admin_panel(update, context, page=2)
                 return
             if data == "admin_config_scanner":
@@ -5335,13 +5283,6 @@ class ScannerBot:
             if data == "admin_log_menu":
                 await self.admin_log_menu(update, context)
                 return
-            if data == "admin_get_logs":
-                if not self.state.is_admin(user_id):
-                    await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
-                    return
-                await query.answer("⏳ در حال آماده‌سازی لاگ‌ها...")
-                await self.send_recent_logs(query.message.chat_id, context)
-                return
             
             await query.answer("❌ دکمه نامعتبر!")
         except Exception as e:
@@ -5374,13 +5315,10 @@ class ScannerBot:
         except Exception as e:
             logger.error(f"Error loading admins: {e}")
         
-        # بارگذاری وضعیت اسکنر
-        # نکته: طبق درخواست، اسکنر کانفنیگ و اسکنر GitHub همیشه در هر بار
-        # استارت ربات خاموش شروع می‌شن (صرف‌نظر از چیزی که قبلاً در دیتابیس
-        # ذخیره شده) - باید هر بار دستی از پنل ادمین روشن بشن.
+        # بارگذاری وضعیت اسکنر (پیش‌فرض خاموش)
         try:
-            self.state.config_scanner_running = False
-            await self.db.set_scanner_state("config_scanner", "False")
+            config_state = await self.db.get_scanner_state("config_scanner")
+            self.state.config_scanner_running = config_state == "True"
             
             proxy_state = await self.db.get_scanner_state("proxy_scanner")
             self.state.proxy_scanner_running = proxy_state == "True"
@@ -5388,10 +5326,14 @@ class ScannerBot:
             txt_state = await self.db.get_scanner_state("txt_scanner")
             self.state.txt_scanner_running = txt_state == "True"
             
-            self.state.github_scanner_running = False
-            await self.db.set_scanner_state("github_scanner", "False")
+            github_state = await self.db.get_scanner_state("github_scanner")
+            self.state.github_scanner_running = github_state == "True"
             
-            logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running} (forced off), Proxy: {self.state.proxy_scanner_running}, TXT: {self.state.txt_scanner_running}, GitHub: {self.state.github_scanner_running} (forced off)")
+            topic_state = await self.db.get_scanner_state("send_to_topic")
+            # پیش‌فرض خاموش است مگر اینکه قبلاً صراحتاً روشن شده باشد
+            self.state.send_to_topic_enabled = topic_state == "True"
+            
+            logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running}, Proxy: {self.state.proxy_scanner_running}, TXT: {self.state.txt_scanner_running}, GitHub: {self.state.github_scanner_running}")
         except Exception as e:
             logger.error(f"Error loading scanner states: {e}")
             self.state.config_scanner_running = False
@@ -5422,7 +5364,7 @@ class ScannerBot:
         self.application.add_error_handler(self.error_handler)
         
         self.scanner = ChannelScanner(self.state, self.db, self.user_client, self.application)
-        self.scanner.setup_live_forward()
+        asyncio.create_task(self.scanner.poll_forward_loop())
         
         # ثبت هندلرها
         self.application.add_handler(CommandHandler("start", self.start_command))
@@ -5438,11 +5380,6 @@ class ScannerBot:
         
         # شروع تسک‌های پس‌زمینه
         asyncio.create_task(self.scanner.scanner_loop())
-        asyncio.create_task(self.scanner.config_producer_loop())
-        asyncio.create_task(self.scanner.config_sender_loop())
-        asyncio.create_task(self.scanner.proxy_producer_loop())
-        asyncio.create_task(self.scanner.proxy_sender_loop())
-        asyncio.create_task(self.scanner.topic_forward_loop())
         asyncio.create_task(self.keep_alive())
         
         # ============ راه‌اندازی وب‌سرور با Webhook ============
