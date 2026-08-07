@@ -27,8 +27,8 @@ from aiohttp import web
 
 # ==================== تنظیمات اصلی (جدید) ====================
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
-API_ID = 32233583
-API_HASH = "ce6caac5e6e987ff33fc613d076570a4"
+API_ID = 31809598
+API_HASH = "9df12f1fa837a291683e8c5802d82e72"
 USER_SESSION_STR = "1BJWap1sBu4O9H5rgWZl_9xxvrQU38Mdm5txmHdrqitJyIHI-hbADUBn9xODcOAhxbFNJNnbf8o3CWrXQZz2_SX4YGbTW2G_5njqpvCgu7zM62LaX7r64gi1uAVlCAyZxfMRZAhcPSjjMjSOOOZCLEYMMlx8v1KdXrpWOKqGdr1xLkAVH8JSemGbS2M5ypNHYDv-sznDmB67Q0tgRyTpO2ceLoYyy1fzAmgq10yfM8XgJPOSSAnlDwp3N87OKaBCwFEPAOF91wZc_9EmgJ2ddP5rl0HYNvdwh3ImqyHckFHnP6fVZATqzDid8sqW4v1HNznhJ6LLbAK4CVbUFDc8mxDjyAJaCwFo="
 OWNER_ID = 8879869880
 PORT = 8080
@@ -1076,7 +1076,7 @@ class ChannelScanner:
         self._github_task = None
     
     async def poll_forward_loop(self):
-        """فورارد بر اساس Polling (طبق درخواست شما): هر ۱۰ ثانیه یک‌بار آخرین
+        """فورارد بر اساس Polling (طبق درخواست شما): هر ۴۰ ثانیه یک‌بار آخرین
         پیام چنل v2reya88 را می‌گیریم و اگر پیام جدیدی بود (که قبلاً فوروارد
         نشده) دقیقاً به تاپیک هدف در گروه فوروارد می‌کنیم. این جایگزین روش
         قبلی (event-محور) شد چون در عمل فوروارد نمی‌کرد."""
@@ -1092,7 +1092,7 @@ class ChannelScanner:
         except ValueError:
             last_forwarded_id = 0
         
-        logger.info(f"👂 Poll-forwarder started for @{CHANNEL_1_USERNAME} -> topic {CONFIG_TOPIC_ID} (هر ۱۰ ثانیه)")
+        logger.info(f"👂 Poll-forwarder started for @{CHANNEL_1_USERNAME} -> topic {CONFIG_TOPIC_ID} (هر ۴۰ ثانیه)")
         
         # این‌ها یک‌بار برای هر «نمونهٔ کلاینت» ست می‌شوند، نه یک‌بار برای کل
         # عمر برنامه - چون وقتی از /start لاگین مجدد انجام شود، self.user_client
@@ -1186,7 +1186,7 @@ class ChannelScanner:
                     await asyncio.sleep(backoff)
                     continue
             
-            await asyncio.sleep(10)
+            await asyncio.sleep(40)  # طبق درخواست: هر ۴۰ ثانیه چک/ارسال
     
     async def check_flood_wait(self) -> Tuple[bool, int]:
         async with self._flood_lock:
