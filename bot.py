@@ -914,6 +914,11 @@ class BotState:
     pending_plan_info: Optional[Dict] = None
     temp_config: Optional[Dict] = None
     
+    # ====== وضعیت لاگین سشن اکانت اسکنر (Telethon) ======
+    session_needs_login: bool = False
+    login_phone: Optional[str] = None
+    login_phone_code_hash: Optional[str] = None
+    
     flood_wait_until: Optional[datetime] = None
     scan_counter: int = 0
     last_scan_reset: datetime = field(default_factory=datetime.now)
@@ -1044,6 +1049,8 @@ class ChannelScanner:
         نشده) دقیقاً به تاپیک هدف در گروه فوروارد می‌کنیم. این جایگزین روش
         قبلی (event-محور) شد چون در عمل فوروارد نمی‌کرد."""
         from telethon.tl.functions.channels import JoinChannelRequest
+        from telethon.tl.functions.messages import ForwardMessagesRequest
+        import random
         
         for username in (CHANNEL_1_USERNAME, CHANNEL_2_USERNAME):
             try:
@@ -1064,18 +1071,30 @@ class ChannelScanner:
         
         while True:
             try:
+                if self.state.session_needs_login:
+                    await asyncio.sleep(10)
+                    continue
+                
                 if self.state.send_to_topic_enabled:
                     messages = await self.user_client.get_messages(CHANNEL_1_USERNAME, limit=1)
                     if messages:
                         latest = messages[0]
                         if latest.id > last_forwarded_id:
                             try:
-                                await self.user_client.forward_messages(
-                                    entity=GROUP_ID,
-                                    messages=latest.id,
+                                # نسخهٔ نصب‌شدهٔ Telethon متد سطح‌بالای
+                                # forward_messages() آرگومان top_msg_id
+                                # (فوروارد داخل تاپیک) را قبول نمی‌کند - همان
+                                # خطای «unexpected keyword argument top_msg_id»
+                                # که در لاگ‌ها بود. به‌جایش از API خام
+                                # ForwardMessagesRequest استفاده می‌کنیم که
+                                # این پارامتر را مستقیم پشتیبانی می‌کند.
+                                await self.user_client(ForwardMessagesRequest(
                                     from_peer=CHANNEL_1_USERNAME,
-                                    top_msg_id=CONFIG_TOPIC_ID
-                                )
+                                    id=[latest.id],
+                                    to_peer=GROUP_ID,
+                                    top_msg_id=CONFIG_TOPIC_ID,
+                                    random_id=[random.randint(0, 2**63 - 1)]
+                                ))
                                 logger.info(f"✅ Poll-forwarded message {latest.id} from @{CHANNEL_1_USERNAME} to topic {CONFIG_TOPIC_ID}")
                             except Exception as fwd_err:
                                 logger.error(f"❌ Poll forward error: {fwd_err}")
@@ -1578,11 +1597,10 @@ class ChannelScanner:
             logger.error(f"Send log error: {e}")
     
     async def process_txt_configs(self):
-        """پردازش و ارسال کانفنیگ‌های صف TXT"""
-        if self._txt_sending:
-            return
-        
-        self._txt_sending = True
+        """پردازش و ارسال کانفنیگ‌های صف TXT. پرچم self._txt_sending را
+        فراخوان (scanner_loop) از قبل True می‌کند؛ همان باگ گیت‌هاب این‌جا
+        هم بود (چک/ست دوباره باعث خروج فوری و گیر کردن پرچم روی True
+        می‌شد) که رفع شد."""
         logger.info("📂 Starting TXT configs sender...")
         
         try:
@@ -1646,11 +1664,13 @@ class ChannelScanner:
         return result
     
     async def process_github_configs(self):
-        """ارسال کانفنیگ‌های صف گیت‌هاب - هر ۳۰ ثانیه یکی، مستقل از اسکنر واقعی"""
-        if self._github_sending:
-            return
-        
-        self._github_sending = True
+        """ارسال کانفنیگ‌های صف گیت‌هاب - هر ۳۰ ثانیه یکی، مستقل از اسکنر واقعی.
+        نکته مهم: پرچم self._github_sending را فراخوان (scanner_loop) قبل از
+        ساختن این تسک True می‌کند - این تابع فقط در finally آن را False
+        می‌کند. قبلاً این‌جا دوباره چک/ست می‌شد که باعث می‌شد تابع همیشه
+        فوراً (بدون انجام کاری) خارج شود و پرچم برای همیشه True بماند و
+        دیگر هیچ‌وقت این ارسال‌کننده اجرا نشود - همان باگی که کانفنیگ‌های
+        گیت‌هاب/ساب اصلاً ارسال نمی‌شدند."""
         logger.info("🐙 Starting GitHub configs sender...")
         
         try:
@@ -1750,11 +1770,28 @@ class ChannelScanner:
                 logger.error(f"❌ Link auto-recheck loop error: {e}")
     
     async def scanner_loop(self):
-        logger.info("🔄 Scanner loop started (Every 3 seconds)...")
-        
+        """نقطهٔ ورودی سازگار با قبل: هر سه اسکنر (کانفنیگ، پروکسی، و
+        راه‌انداز TXT/GitHub) را به‌صورت تسک‌های کاملاً مستقل اجرا می‌کند.
+        قبلاً همه این‌ها داخل یک حلقهٔ سکانسیال بودند؛ چون اسکن ۱۰ چنل
+        پروکسی به‌تنهایی ۶۰-۹۰ ثانیه طول می‌کشید، تا وقتی آن تمام نمی‌شد
+        نوبت به اسکن کانفنیگ یا حتی چک کردن روشن بودن GitHub/TXT نمی‌رسید -
+        همین باعث کندی ارسال کانفنیگ و گیر کردن اسکنر گیت‌هاب می‌شد. حالا
+        هر بخش حلقهٔ خودش را دارد و مستقل از بقیه اجرا می‌شود."""
+        logger.info("🔄 Scanner loop started (config/proxy/trigger مستقل از هم)")
+        asyncio.create_task(self.config_scan_loop())
+        asyncio.create_task(self.proxy_scan_loop())
+        asyncio.create_task(self.trigger_loop())
+    
+    async def config_scan_loop(self):
+        """اسکن مداوم چنل‌های منبع کانفنیگ - کاملاً مستقل از اسکنر پروکسی،
+        تا اسکن پروکسی (که کند است) سرعت ارسال کانفنیگ را پایین نیاورد."""
+        logger.info("🔍 Config scan loop started")
         while True:
             try:
-                # ====== اسکنر کانفنیگ از چنل‌ها ======
+                if self.state.session_needs_login:
+                    await asyncio.sleep(10)
+                    continue
+                
                 if self.state.config_scanner_running:
                     for channel in SOURCE_CONFIG_CHANNELS:
                         if not self.state.config_scanner_running:
@@ -1778,8 +1815,21 @@ class ChannelScanner:
                         await asyncio.sleep(3)
                     
                     await asyncio.sleep(1)
+                else:
+                    await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Config scan loop error: {e}")
+                await asyncio.sleep(5)
+    
+    async def proxy_scan_loop(self):
+        """اسکن مداوم چنل‌های منبع پروکسی - کاملاً مستقل از اسکنر کانفنیگ."""
+        logger.info("🔍 Proxy scan loop started")
+        while True:
+            try:
+                if self.state.session_needs_login:
+                    await asyncio.sleep(10)
+                    continue
                 
-                # ====== اسکنر پروکسی ======
                 if self.state.proxy_scanner_running:
                     for channel in SOURCE_PROXY_CHANNELS:
                         if not self.state.proxy_scanner_running:
@@ -1801,28 +1851,33 @@ class ChannelScanner:
                                     await asyncio.sleep(1)
                         
                         await asyncio.sleep(3)
-                
-                # ====== اسکنر TXT (کانفنیگ‌های فایل) ======
-                if self.state.txt_scanner_running:
-                    if not self._txt_sending:
-                        # فلگ را همین‌جا و به‌صورت سینک روشن می‌کنیم تا در
-                        # چرخهٔ بعدی حلقه (که ممکن است قبل از اجرای واقعی
-                        # تسک پیش بیاید) دوباره تسک ساخته نشود.
-                        self._txt_sending = True
-                        asyncio.create_task(self.process_txt_configs())
-                
-                # ====== اسکنر GitHub - مستقل، کنار اسکنر واقعی ======
-                if self.state.github_scanner_running:
-                    if not self._github_sending:
-                        self._github_sending = True
-                        asyncio.create_task(self.process_github_configs())
-                
-                # همیشه یک مکث کوچک - جلوگیری از حلقهٔ بدون‌مکث (busy-loop)
-                # وقتی فقط txt یا github فعال‌اند و config/proxy خاموش‌اند
-                await asyncio.sleep(1)
                     
+                    await asyncio.sleep(1)
+                else:
+                    await asyncio.sleep(1)
             except Exception as e:
-                logger.error(f"Scanner loop error: {e}")
+                logger.error(f"Proxy scan loop error: {e}")
+                await asyncio.sleep(5)
+    
+    async def trigger_loop(self):
+        """هر ثانیه چک می‌کند که آیا اسکنر TXT یا GitHub روشن شده ولی
+        هنوز تسک ارسالش استارت نخورده - اگر بله، تسک را می‌سازد. این حلقه
+        خیلی سبک است (فقط چک یک بولین) پس هیچ‌وقت معطل اسکن پروکسی/کانفنیگ
+        نمی‌ماند."""
+        logger.info("⚡ Trigger loop started (TXT/GitHub)")
+        while True:
+            try:
+                if self.state.txt_scanner_running and not self._txt_sending:
+                    self._txt_sending = True
+                    asyncio.create_task(self.process_txt_configs())
+                
+                if self.state.github_scanner_running and not self._github_sending:
+                    self._github_sending = True
+                    asyncio.create_task(self.process_github_configs())
+                
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Trigger loop error: {e}")
                 await asyncio.sleep(5)
     
     # ==================== مدیریت فایل TXT ====================
@@ -4220,6 +4275,10 @@ class ScannerBot:
             await self.db.add_user(user_id, username, first_name, last_name, ref_id)
             
             if self.state.is_admin(user_id):
+                if self.state.session_needs_login:
+                    await self.start_session_login(update, context)
+                    return
+                
                 keyboard = self.main_menu_buttons(user_id)
                 await update.message.reply_text(
                     "به ربات اسکنر خوش آمدید!\n\nشما دسترسی ادمین دارید.",
@@ -4431,6 +4490,111 @@ class ScannerBot:
             f"برای ارسال فوری همین‌الان (هر ۳۰ ثانیه یک کانفنیگ) دکمه START را در پنل بزنید.\n"
             f"🔁 از این به بعد این لینک هر ۱۰ دقیقه خودکار دوباره چک می‌شود و اگر کانفنیگ جدیدی اضافه شده باشد، خودکار (بدون نیاز به START) برایتان نوتیف می‌آید و فوروارد می‌شود.",
             reply_markup=self.github_scanner_buttons()
+        )
+    
+    # ==================== لاگین مجدد سشن اسکنر (وقتی سشن غیرفعال است) ====================
+    async def start_session_login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """قدم اول: از ادمین شماره تلفن را می‌گیرد."""
+        context.user_data['waiting_for_login_phone'] = True
+        await update.message.reply_text(
+            "⚠️ سشن اکانت اسکنر غیرفعال است.\n\n"
+            "📱 لطفاً شماره تلفن اکانت را همراه با کد کشور وارد کنید:\n"
+            "مثال: +989123456789"
+        )
+    
+    async def receive_login_phone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        phone = (message.text or "").strip()
+        context.user_data['waiting_for_login_phone'] = False
+        
+        if not phone.startswith('+') or len(phone) < 8:
+            await message.reply_text("❌ فرمت شماره درست نیست. با + و کد کشور وارد کنید، مثال: +989123456789")
+            context.user_data['waiting_for_login_phone'] = True
+            return
+        
+        wait_msg = await message.reply_text("🔄 در حال ارسال کد تایید...")
+        
+        try:
+            if not self.user_client.is_connected():
+                await self.user_client.connect()
+            
+            sent = await self.user_client.send_code_request(phone)
+            self.state.login_phone = phone
+            self.state.login_phone_code_hash = sent.phone_code_hash
+            context.user_data['waiting_for_login_code'] = True
+            
+            await wait_msg.edit_text(
+                "✅ کد تایید به تلگرام همان اکانت ارسال شد.\n\n"
+                "🔢 لطفاً کد را وارد کنید (فقط عدد):\n"
+                "توجه: اگر تلگرام بین رقم‌ها فاصله گذاشت، بدون فاصله وارد کنید."
+            )
+        except Exception as e:
+            logger.error(f"❌ send_code_request error: {e}")
+            await wait_msg.edit_text(f"❌ خطا در ارسال کد: {str(e)[:200]}\n\nدوباره شماره را وارد کنید:")
+            context.user_data['waiting_for_login_phone'] = True
+    
+    async def receive_login_code(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        code = (message.text or "").strip().replace(" ", "")
+        context.user_data['waiting_for_login_code'] = False
+        
+        wait_msg = await message.reply_text("🔄 در حال بررسی کد...")
+        
+        try:
+            from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
+            
+            try:
+                await self.user_client.sign_in(
+                    phone=self.state.login_phone,
+                    code=code,
+                    phone_code_hash=self.state.login_phone_code_hash
+                )
+            except SessionPasswordNeededError:
+                context.user_data['waiting_for_login_password'] = True
+                await wait_msg.edit_text("🔐 این اکانت رمز دو مرحله‌ای (2FA) دارد.\nلطفاً رمز را وارد کنید:")
+                return
+            
+            await self._finish_session_login(update, wait_msg)
+            
+        except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+            await wait_msg.edit_text(f"❌ کد اشتباه یا منقضی‌شده است: {e}\n\nبرای شروع دوباره /start را بزنید.")
+        except Exception as e:
+            logger.error(f"❌ sign_in error: {e}")
+            await wait_msg.edit_text(f"❌ خطا: {str(e)[:200]}\n\nبرای شروع دوباره /start را بزنید.")
+    
+    async def receive_login_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        password = (message.text or "").strip()
+        context.user_data['waiting_for_login_password'] = False
+        
+        wait_msg = await message.reply_text("🔄 در حال بررسی رمز...")
+        
+        try:
+            await self.user_client.sign_in(password=password)
+            await self._finish_session_login(update, wait_msg)
+        except Exception as e:
+            logger.error(f"❌ 2FA sign_in error: {e}")
+            await wait_msg.edit_text(f"❌ رمز اشتباه یا خطا: {str(e)[:200]}\n\nبرای شروع دوباره /start را بزنید.")
+    
+    async def _finish_session_login(self, update: Update, wait_msg):
+        """بعد از موفقیت لاگین: سشن جدید را در دیتابیس ذخیره می‌کند (تا بعد
+        از ری‌استارت هم بدون نیاز به ادیت کد باقی بماند)، اسکنرهای متوقف‌شده
+        را دوباره روشن می‌کند و رشتهٔ سشن جدید را برای ادمین می‌فرستد."""
+        new_session_str = self.user_client.session.save()
+        await self.db.set_scanner_state("user_session_string", new_session_str)
+        
+        self.state.session_needs_login = False
+        self.state.login_phone = None
+        self.state.login_phone_code_hash = None
+        
+        me = await self.user_client.get_me()
+        
+        await wait_msg.edit_text(
+            f"✅ لاگین با موفقیت انجام شد!\n"
+            f"👤 اکانت: @{me.username if me.username else me.first_name}\n\n"
+            f"سشن جدید ذخیره شد و اسکنرها دوباره فعال شدند.\n\n"
+            f"🔑 رشتهٔ سشن جدید (برای پشتیبان‌گیری دستی نگه دارید):\n`{new_session_str}`",
+            parse_mode=ParseMode.MARKDOWN
         )
     
     # ==================== مدیریت ادمین ====================
@@ -4760,7 +4924,7 @@ class ScannerBot:
                     except Exception as e:
                         logger.error(f"❌ Bot ping failed: {e}")
                 
-                if self.user_client:
+                if self.user_client and not self.state.session_needs_login:
                     try:
                         await self.user_client.get_me()
                         logger.info(f"✅ Client ping: OK")
@@ -4782,14 +4946,32 @@ class ScannerBot:
     
     # ==================== Webhook ====================
     async def webhook_handler(self, request):
+        """این‌جا فقط JSON آپدیت را می‌خوانیم و بلافاصله OK برمی‌گردانیم؛
+        پردازش واقعی آپدیت (که ممکن است شامل یک دانلود کند از اینترنت باشد،
+        مثل چک کردن لینک گیت‌هاب) به‌صورت تسک پس‌زمینه انجام می‌شود. قبلاً
+        کل پردازش این‌جا await می‌شد، یعنی اگر یک هندلر کند بود (مثل دانلود
+        لینک) کل درخواست وبهوک معطل می‌ماند و اگر پلتفرم هاست (ریلوی) یا
+        پروکسی جلویی درخواست را به‌خاطر طول‌کشیدن قطع/کنسل می‌کرد، خطا
+        asyncio.CancelledError بود که توسط except Exception گرفته نمی‌شد -
+        نتیجه: نه پیام نتیجه ادیت می‌شد، نه هیچ خطایی لاگ می‌شد؛ دقیقاً
+        همون چیزی که در لاگ‌ها دیده شد (لینک گیت‌هاب ارسال می‌شد ولی هیچ‌وقت
+        نتیجه‌اش نمی‌آمد)."""
         try:
             data = await request.json()
             update = Update.de_json(data, self.application.bot)
-            await self.application.process_update(update)
+            asyncio.create_task(self._process_update_safe(update))
             return web.Response(text="OK")
         except Exception as e:
             logger.error(f"Webhook error: {e}")
             return web.Response(text="Error", status=500)
+    
+    async def _process_update_safe(self, update):
+        try:
+            await self.application.process_update(update)
+        except Exception as e:
+            logger.error(f"❌ process_update error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     async def health_handler(self, request):
         return web.Response(text="Bot is running! ✅")
@@ -4845,6 +5027,19 @@ class ScannerBot:
             user.first_name if user.first_name else None,
             user.last_name if user.last_name else None
         )
+        
+        # ====== لاگین مجدد سشن اسکنر (شماره/کد/رمز دو مرحله‌ای) ======
+        if context.user_data.get('waiting_for_login_phone') and message.text:
+            await self.receive_login_phone(update, context)
+            return
+        
+        if context.user_data.get('waiting_for_login_code') and message.text:
+            await self.receive_login_code(update, context)
+            return
+        
+        if context.user_data.get('waiting_for_login_password') and message.text:
+            await self.receive_login_password(update, context)
+            return
         
         # دریافت فایل TXT
         if context.user_data.get('waiting_for_txt') and message.document:
@@ -5417,21 +5612,33 @@ class ScannerBot:
             self.state.txt_scanner_running = False
             self.state.github_scanner_running = False
         
-        # اتصال به اکانت تلگرام
-        if not USER_SESSION_STR:
-            logger.error("❌ ERROR: USER_SESSION_STR not set!")
-            return
+        # ==================== اتصال به اکانت تلگرام (Session) ====================
+        # نکته مهم: قبلاً اگر سشن غیرفعال بود، اینجا با return کل ربات
+        # (حتی سمت BOT_TOKEN که با /start صحبت می‌کند) هرگز استارت
+        # نمی‌خورد - یعنی هیچ راهی برای لاگین دوباره از داخل خود ربات
+        # نبود. حالا اگر سشن غیرفعال باشد، فقط پرچم session_needs_login
+        # روشن می‌شود؛ ربات کنترلی (BOT_TOKEN) طبق معمول بالا می‌آید و
+        # ادمین می‌تواند با زدن /start شماره و کد تایید را وارد کند تا
+        # سشن جدید ساخته شود - بدون نیاز به ری‌دیپلوی یا ادیت کد.
+        saved_session = await self.db.get_scanner_state("user_session_string")
+        session_str_to_use = saved_session if saved_session and saved_session != "False" else USER_SESSION_STR
         
+        self.user_client = TelegramClient(StringSession(session_str_to_use), API_ID, API_HASH)
         try:
-            self.user_client = TelegramClient(StringSession(USER_SESSION_STR), API_ID, API_HASH)
-            await self.user_client.start()
-            me = await self.user_client.get_me()
-            logger.info(f"✅ Scanner client connected!")
-            logger.info(f"   👤 Username: @{me.username if me.username else 'None'}")
-            logger.info(f"   🆔 User ID: {me.id}")
+            await self.user_client.connect()
+            if session_str_to_use and await self.user_client.is_user_authorized():
+                me = await self.user_client.get_me()
+                logger.info(f"✅ Scanner client connected!")
+                logger.info(f"   👤 Username: @{me.username if me.username else 'None'}")
+                logger.info(f"   🆔 User ID: {me.id}")
+                self.state.session_needs_login = False
+            else:
+                logger.error("⚠️ Session غیرفعال/نامعتبر است! ادمین باید در ربات /start بزند تا دوباره لاگین کند.")
+                self.state.session_needs_login = True
         except Exception as e:
             logger.error(f"❌ Scanner client error: {e}")
-            return
+            logger.error("⚠️ ادمین باید در ربات /start بزند تا دوباره لاگین کند.")
+            self.state.session_needs_login = True
         
         # راه‌اندازی ربات
         self.application = Application.builder().token(BOT_TOKEN).build()
