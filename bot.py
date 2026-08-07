@@ -665,8 +665,8 @@ class Database:
             duplicate = 0
             invalid = 0
             
-            # الگوی تشخیص کانفنیگ معتبر - پشتیبانی از ss://, vless://, vmess://, trojan://, hy2://, wireguard://
-            valid_patterns = ['vless://', 'vmess://', 'trojan://', 'ss://', 'hy2://', 'wireguard://']
+            # الگوی تشخیص کانفنیگ معتبر - فقط vless/vmess/trojan/hysteria(hy2) - ss:// دیگر پذیرفته نمی‌شود
+            valid_patterns = ['vless://', 'vmess://', 'trojan://', 'hy2://']
             
             for config in configs:
                 config = config.strip()
@@ -745,7 +745,8 @@ class Database:
             duplicate = 0
             invalid = 0
             
-            valid_patterns = ['vless://', 'vmess://', 'trojan://', 'ss://', 'hy2://', 'wireguard://']
+            # فقط vless/vmess/trojan/hysteria(hy2) - ss:// دیگر پذیرفته نمی‌شود
+            valid_patterns = ['vless://', 'vmess://', 'trojan://', 'hy2://']
             
             for config in configs:
                 config = config.strip()
@@ -783,6 +784,18 @@ class Database:
                 'total': len(configs)
             }
     
+    async def clear_github_queue(self) -> int:
+        """پاک کردن کامل صف کانفنیگ‌های گیت‌هاب (ریست قسمت گیت‌هاب).
+        هر بار که لینک جدیدی ثبت می‌شود این متد صدا زده می‌شود تا کانفنیگ‌های
+        قدیمی/گیرکرده از دفعات قبل باقی نمانند."""
+        async with self.pool.acquire() as conn:
+            result = await conn.execute('DELETE FROM github_queue')
+            try:
+                deleted = int(result.split()[-1])
+            except Exception:
+                deleted = 0
+            return deleted
+    
     async def get_next_github_config_from_queue(self) -> Optional[str]:
         """دریافت یک کانفنیگ گیت‌هاب از صف برای ارسال"""
         async with self.pool.acquire() as conn:
@@ -802,9 +815,12 @@ class Database:
         async with self.pool.acquire() as conn:
             total = await conn.fetchrow('SELECT COUNT(*) FROM github_queue')
             remaining = await conn.fetchrow('SELECT COUNT(*) FROM github_queue WHERE sent = FALSE')
+            total_n = total[0] if total else 0
+            remaining_n = remaining[0] if remaining else 0
             return {
-                'total': total[0] if total else 0,
-                'remaining': remaining[0] if remaining else 0
+                'total': total_n,
+                'remaining': remaining_n,
+                'sent': total_n - remaining_n
             }
 
 # ==================== لینک چنل‌ها ====================
@@ -1035,7 +1051,8 @@ class ChannelScanner:
         self.db = db
         self.user_client = user_client
         self.bot_app = bot_app
-        self.config_regex = re.compile(r"(vless://\S+|vmess://\S+|trojan://\S+|ss://\S+|hy2://\S+|wireguard://\S+)")
+        # طبق درخواست: فقط vless / vmess / trojan / hysteria(hy2) فوروارد شوند - ss:// و wireguard دیگر پذیرفته نمی‌شوند
+        self.config_regex = re.compile(r"(vless://\S+|vmess://\S+|trojan://\S+|hy2://\S+)")
         self._flood_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(2)
         self._txt_sending = False
@@ -1059,6 +1076,27 @@ class ChannelScanner:
             except Exception as e:
                 logger.error(f"⚠️ Could not join @{username}: {e} (اگر قبلاً عضو هستید این خطا مهم نیست)")
         
+        # === رفع اصلیِ باگ «فوروارد نمی‌کنه» ===
+        # ForwardMessagesRequest یک درخواست خام (raw API) است و برخلاف
+        # forward_messages سطح‌بالا، خودش entity را resolve نمی‌کند. اگر
+        # GROUP_ID قبلاً هیچ‌جا (دیالوگ/پیام) توسط این سشن دیده نشده باشد،
+        # Telethon نمی‌تواند InputPeer آن را بسازد و همان خطای لاگ‌ها را
+        # می‌دهد: "Could not find the input entity for PeerChannel(...)".
+        # راه‌حل: یک‌بار در ابتدا با get_entity آن را resolve و کش می‌کنیم
+        # (و اگر نشد، یک‌بار get_dialogs کل چت‌ها را کش می‌کند).
+        group_entity = None
+        try:
+            group_entity = await self.user_client.get_entity(GROUP_ID)
+            logger.info(f"✅ Group entity resolved and cached: {GROUP_ID}")
+        except Exception as e:
+            logger.error(f"⚠️ Could not resolve group entity directly: {e} - trying get_dialogs()")
+            try:
+                await self.user_client.get_dialogs()
+                group_entity = await self.user_client.get_entity(GROUP_ID)
+                logger.info(f"✅ Group entity resolved via dialogs cache: {GROUP_ID}")
+            except Exception as e2:
+                logger.error(f"❌ Still could not resolve group entity: {e2} - forwarding will keep failing until the scanner account can see this group (must be a member).")
+        
         # بازیابی آخرین آیدی فوروارد شده از دیتابیس (برای اینکه بعد از ری‌استارت
         # دوباره پیام‌های قدیمی را فوروارد نکند)
         last_id_str = await self.db.get_scanner_state("last_forwarded_config_msg_id")
@@ -1069,13 +1107,25 @@ class ChannelScanner:
         
         logger.info(f"👂 Poll-forwarder started for @{CHANNEL_1_USERNAME} -> topic {CONFIG_TOPIC_ID} (هر ۱۰ ثانیه)")
         
+        consecutive_errors = 0
         while True:
             try:
                 if self.state.session_needs_login:
                     await asyncio.sleep(10)
                     continue
                 
-                if self.state.send_to_topic_enabled:
+                if not self.user_client.is_connected():
+                    # اگر قطع است، دوباره وصل شو قبل از هر درخواستی - وگرنه
+                    # "Cannot send requests while disconnected" پشت سر هم می‌آید
+                    await self.user_client.connect()
+                
+                if group_entity is None:
+                    try:
+                        group_entity = await self.user_client.get_entity(GROUP_ID)
+                    except Exception:
+                        pass
+                
+                if self.state.send_to_topic_enabled and group_entity is not None:
                     messages = await self.user_client.get_messages(CHANNEL_1_USERNAME, limit=1)
                     if messages:
                         latest = messages[0]
@@ -1087,21 +1137,35 @@ class ChannelScanner:
                                 # خطای «unexpected keyword argument top_msg_id»
                                 # که در لاگ‌ها بود. به‌جایش از API خام
                                 # ForwardMessagesRequest استفاده می‌کنیم که
-                                # این پارامتر را مستقیم پشتیبانی می‌کند.
+                                # این پارامتر را مستقیم پشتیبانی می‌کند - و
+                                # به‌جای GROUP_ID خام، از entity resolve‌شده
+                                # استفاده می‌کنیم.
                                 await self.user_client(ForwardMessagesRequest(
                                     from_peer=CHANNEL_1_USERNAME,
                                     id=[latest.id],
-                                    to_peer=GROUP_ID,
+                                    to_peer=group_entity,
                                     top_msg_id=CONFIG_TOPIC_ID,
                                     random_id=[random.randint(0, 2**63 - 1)]
                                 ))
                                 logger.info(f"✅ Poll-forwarded message {latest.id} from @{CHANNEL_1_USERNAME} to topic {CONFIG_TOPIC_ID}")
+                                consecutive_errors = 0
                             except Exception as fwd_err:
                                 logger.error(f"❌ Poll forward error: {fwd_err}")
                             last_forwarded_id = latest.id
                             await self.db.set_scanner_state("last_forwarded_config_msg_id", str(last_forwarded_id))
+                consecutive_errors = 0
             except Exception as e:
+                consecutive_errors += 1
                 logger.error(f"❌ Poll-forward loop error: {e}")
+                # اگر سشن روی دو IP همزمان استفاده شده باشد (خطای authorization
+                # key)، تلاش سریع پشت‌سرهم فقط وضعیت را بدتر می‌کند. عقب‌نشینی
+                # نمایی می‌کنیم تا اگر یک دیپلوی/نمونهٔ قدیمی هنوز روشن است
+                # فرصت بسته شدن پیدا کند.
+                if "different IP addresses" in str(e) or "two different IP" in str(e):
+                    backoff = min(30 * consecutive_errors, 300)
+                    logger.error(f"⛔ Session used from two IPs at once - این یعنی دو نمونه از ربات با یک سشن همزمان روشن است (مثلاً دیپلوی قبلی Railway هنوز کاملاً خاموش نشده). {backoff}s صبر می‌کنیم.")
+                    await asyncio.sleep(backoff)
+                    continue
             
             await asyncio.sleep(10)
     
@@ -1133,8 +1197,8 @@ class ChannelScanner:
         if not text:
             return []
         
-        # الگوی کامل برای همه پروتکل‌ها
-        pattern = r'(vless://[^\s]+|vmess://[^\s]+|trojan://[^\s]+|ss://[^\s]+|hy2://[^\s]+|wireguard://[^\s]+)'
+        # فقط vless/vmess/trojan/hysteria(hy2) - ss:// و wireguard دیگر استخراج/ارسال نمی‌شوند
+        pattern = r'(vless://[^\s]+|vmess://[^\s]+|trojan://[^\s]+|hy2://[^\s]+)'
         return re.findall(pattern, text)
     
     async def extract_configs_from_file(self, file_content: bytes) -> List[str]:
@@ -1246,7 +1310,8 @@ class ChannelScanner:
     def is_valid_config(self, config_text: str) -> bool:
         if not config_text:
             return False
-        valid_protocols = ['vless://', 'vmess://', 'trojan://', 'ss://', 'hy2://', 'wireguard://']
+        # طبق درخواست: ss:// دیگر معتبر نیست، فقط vless/vmess/trojan/hysteria(hy2)
+        valid_protocols = ['vless://', 'vmess://', 'trojan://', 'hy2://']
         return any(config_text.startswith(p) for p in valid_protocols)
     
     def is_proxy_link(self, url: str) -> bool:
@@ -1543,7 +1608,14 @@ class ChannelScanner:
                 logger.info(f"⏭️ Proxy already sent: {proxy_hash[:10]}...")
                 return True
             
+            # طبق درخواست: قبلاً لینک پروکسی فقط داخل دکمه بود و درست
+            # کپی نمی‌شد (چون داخل URL دکمه، کاراکترهای encode‌شده مثل
+            # سکرت به‌درستی قابل کپی نبودند). حالا لینک کامل را هم داخل
+            # یک بلاک کد HTML (<code>) می‌گذاریم تا با یک لمس، دقیقاً و
+            # کامل کپی شود.
             channel_message = f"""now proxy ⚡️
+
+<code>{html.escape(proxy_url)}</code>
 
 📍 Location: {flag} {html.escape(info.get('country', 'Unknown'))}
 
@@ -1658,6 +1730,11 @@ class ChannelScanner:
                 configs = await self.extract_configs_from_text(json.dumps(data))
             except Exception:
                 pass
+        
+        # طبق درخواست: جدیدترین کانفنیگ‌ها زودتر گرفته/ارسال شوند - معمولاً
+        # جدیدترین موارد در انتهای فایل ساب/گیت‌هاب اضافه می‌شوند، پس لیست
+        # را برعکس می‌کنیم تا صف با جدیدترین‌ها شروع شود.
+        configs = list(reversed(configs))
         
         result = await self.db.add_github_configs_to_queue(configs, source_url=url)
         result['ok'] = True
@@ -4431,19 +4508,12 @@ class ScannerBot:
             return
         await query.answer()
         
-        status = "Running" if self.state.github_scanner_running else "Stopped"
         stats = await self.db.get_github_queue_stats()
         
+        # طبق درخواست: فقط تعداد کانفنیگ موجود و تعداد ارسال‌شده نمایش داده شود
         await query.edit_message_text(
-            f"GitHub / Sub Link Source\n\n"
-            f"Status: {status}\n"
-            f"Current link: {self.state.github_source_url or '-'}\n"
-            f"Total in queue: {stats.get('total', 0)}\n"
-            f"Remaining to send: {stats.get('remaining', 0)}\n\n"
-            f"Send a raw link to load configs from it (checked immediately, result reported).\n"
-            f"🔁 Saved link is auto-rechecked every 10 minutes; any new config found is "
-            f"forwarded automatically and you get notified — no need to press Start.\n"
-            f"Start button: optionally drip-sends everything currently in queue, one every 30s.",
+            f"📦 کانفنیگ موجود: {stats.get('remaining', 0)}\n"
+            f"📤 کانفنیگ ارسال‌شده: {stats.get('sent', 0)}",
             reply_markup=self.github_scanner_buttons()
         )
     
@@ -4471,7 +4541,11 @@ class ScannerBot:
             await message.reply_text("❌ لینک معتبر نیست. لطفاً یک لینک http/https ارسال کنید.")
             return
         
-        wait_msg = await message.reply_text("🔄 در حال دریافت و بررسی لینک...")
+        wait_msg = await message.reply_text("🔄 در حال بررسی لینک...")
+        
+        # طبق درخواست: هر لینک جدید یعنی ریست کامل قسمت گیت‌هاب - کانفنیگ‌های
+        # قبلی (احتمالاً گیرکرده از دفعه قبل) پاک می‌شوند تا صف تازه شروع شود.
+        await self.db.clear_github_queue()
         
         result = await self.scanner.fetch_github_configs(url)
         
@@ -4481,16 +4555,8 @@ class ScannerBot:
         
         self.state.github_source_url = url
         
-        await wait_msg.edit_text(
-            f"✅ لینک بررسی شد.\n\n"
-            f"🆕 کانفنیگ جدید پیدا شد: {result['added']}\n"
-            f"🔄 تکراری: {result['duplicate']}\n"
-            f"❌ نامعتبر: {result['invalid']}\n"
-            f"📦 کل موارد داخل لینک: {result['total']}\n\n"
-            f"برای ارسال فوری همین‌الان (هر ۳۰ ثانیه یک کانفنیگ) دکمه START را در پنل بزنید.\n"
-            f"🔁 از این به بعد این لینک هر ۱۰ دقیقه خودکار دوباره چک می‌شود و اگر کانفنیگ جدیدی اضافه شده باشد، خودکار (بدون نیاز به START) برایتان نوتیف می‌آید و فوروارد می‌شود.",
-            reply_markup=self.github_scanner_buttons()
-        )
+        # طبق درخواست: فقط همین یک پیام ساده
+        await wait_msg.edit_text("✅ لینک ذخیره شد")
     
     # ==================== لاگین مجدد سشن اسکنر (وقتی سشن غیرفعال است) ====================
     async def start_session_login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
