@@ -28,7 +28,7 @@ from aiohttp import web
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
 API_ID = 32233583
 API_HASH = "ce6caac5e6e987ff33fc613d076570a4"
-USER_SESSION_STR = "1BJWap1sBu4O9H5rgWZl_9xxvrQU38Mdm5txmHdrqitJyIHI-hbADUBn9xODcOAhxbFNJNnbf8o3CWrXQZz2_SX4YGbTW2G_5njqpvCgu7zM62LaX7r64gi1uAVlCAyZxfMRZAhcPSjjMjSOOOZCLEYMMlx8v1KdXrpWOKqGdr1xLkAVH8JSemGbS2M5ypNHYDv-sznDmB67Q0tgRyTpO2ceLoYyy1fzAmgq10yfM8XgJPOSSAnlDwp3N87OKaBCwFEPAOF91wZc_9EmgJ2ddP5rl0HYNvdwh3ImqyHckFHnP6fVZATqzDid8sqW4v1HNznhJ6LLbAK4CVbUFDc8mxDjyAJaCwFo="
+USER_SESSION_STR = "1BJWap1wBuxBo54uf5eRvIW8RHwOqXT1cbr9Zyk-iUjVdSa9Uv27BNQh1Kt7nbHmsK4zZVildCltmSF48twpM6oVlCAeV27VVT82kvAGtBeI21dhanmIdaNgpZIqFR--BrbSJkJxzwAc1mpIA69_FWMsjMPgoUNSu3wHVFOWOh9kZcvgNO-Dkt9dOI5vZO_cLnbmVPz6EyEDe_jHC504opvTlhGl_BujiSdCXPosrvE1eEdMFolZt8jLRSecDBsG-_l7VvxzBC8aeTTuoUdp_UPQ6lLNKai9z4PRusx1gnl2KLES4vfY-qwAfR50qR4WNy-rjcYxiY7CDk0pSZwkYYKt1Q8VXZ2s="
 OWNER_ID = 8879869880
 PORT = 8080
 GROQ_API_KEY = "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"
@@ -711,6 +711,19 @@ class Database:
                 'invalid': invalid,
                 'total': len(configs)
             }
+    
+    async def clear_config_queue(self) -> int:
+        """پاک کردن کامل صف کانفنیگ‌های TXT (ریست قسمت TXT).
+        هر بار که فایل TXT جدیدی آپلود می‌شود این متد صدا زده می‌شود تا
+        کانفنیگ‌های قدیمیِ ذخیره‌شده از فایل‌های قبلی باقی نمانند."""
+        async with self.pool.acquire() as conn:
+            result = await conn.execute('DELETE FROM config_queue')
+            try:
+                deleted = int(result.split()[-1])
+            except Exception:
+                deleted = 0
+            await conn.execute("UPDATE stats SET value = 0 WHERE key = 'remaining_txt_configs'")
+            return deleted
     
     async def get_next_config_from_queue(self) -> Optional[str]:
         """دریافت یک کانفنیگ از صف برای ارسال"""
@@ -1998,6 +2011,11 @@ class ChannelScanner:
             if not configs:
                 await message.reply_text("❌ هیچ کانفنیگ معتبری در فایل پیدا نشد!\n\nپروتکل‌های پشتیبانی شده:\n• vless://\n• vmess://\n• trojan://\n• hy2:// / hysteria2://")
                 return
+            
+            # طبق درخواست: هر فایل TXT جدید یعنی ریست کامل قسمت TXT -
+            # کانفنیگ‌های ذخیره‌شده از فایل(های) قبلی پاک می‌شوند تا صف
+            # همیشه فقط مربوط به آخرین فایل ارسالی باشد.
+            await self.db.clear_config_queue()
             
             # اضافه کردن به صف
             result = await self.db.add_configs_to_queue(configs, file_name)
