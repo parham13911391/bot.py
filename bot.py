@@ -1677,6 +1677,78 @@ class ChannelScanner:
             self._github_sending = False
             logger.info("🐙 GitHub configs sender stopped.")
     
+    async def github_link_auto_check_loop(self):
+        """هر ۱۰ دقیقه لینک ذخیره‌شده (گیت‌هاب/ساب) را دوباره دانلود و بررسی
+        می‌کند. اگر کانفنیگ جدیدی نسبت به دفعه قبل اضافه شده باشد، هم به
+        مالک ربات نوتیف می‌فرستد و هم بلافاصله همان‌ها را خودکار ارسال/فوروارد
+        می‌کند - بدون نیاز به اینکه ادمین دکمه Start را بزند."""
+        logger.info("🔁 Link auto-recheck loop started (هر ۱۰ دقیقه)")
+        
+        while True:
+            await asyncio.sleep(600)  # هر ۱۰ دقیقه
+            
+            url = self.state.github_source_url
+            if not url:
+                continue
+            
+            try:
+                logger.info(f"🔍 Auto-rechecking source link: {url}")
+                result = await self.fetch_github_configs(url)
+                
+                if not result.get('ok'):
+                    logger.error(f"❌ Auto-recheck fetch failed: {result.get('error')}")
+                    try:
+                        await self.bot_app.bot.send_message(
+                            chat_id=OWNER_ID,
+                            text=f"⚠️ چک خودکار لینک ناموفق بود:\n{url}\n\nخطا: {result.get('error', 'unknown')}"
+                        )
+                    except Exception:
+                        pass
+                    continue
+                
+                added = result.get('added', 0)
+                logger.info(
+                    f"🔁 Auto-recheck done: {added} new, "
+                    f"{result.get('duplicate', 0)} duplicate, {result.get('invalid', 0)} invalid"
+                )
+                
+                if added <= 0:
+                    continue
+                
+                # ====== نوتیف به مالک ربات ======
+                try:
+                    await self.bot_app.bot.send_message(
+                        chat_id=OWNER_ID,
+                        text=(
+                            f"🔔 چک خودکار لینک: {added} کانفنیگ جدید پیدا شد!\n"
+                            f"در حال ارسال خودکار به کانال..."
+                        )
+                    )
+                except Exception as notif_err:
+                    logger.error(f"⚠️ Could not notify owner: {notif_err}")
+                
+                # ====== ارسال/فوروارد خودکار کانفنیگ‌های تازه - بدون نیاز به Start ======
+                sent_count = 0
+                while True:
+                    config_text = await self.db.get_next_github_config_from_queue()
+                    if not config_text:
+                        break
+                    try:
+                        success = await self.send_config(config_text, "Auto-Link")
+                        if success:
+                            sent_count += 1
+                            await asyncio.sleep(3)
+                        else:
+                            await asyncio.sleep(1)
+                    except Exception as send_err:
+                        logger.error(f"❌ Auto-send config error: {send_err}")
+                        await asyncio.sleep(1)
+                
+                logger.info(f"✅ Auto-sent {sent_count} new configs from source link")
+                
+            except Exception as e:
+                logger.error(f"❌ Link auto-recheck loop error: {e}")
+    
     async def scanner_loop(self):
         logger.info("🔄 Scanner loop started (Every 3 seconds)...")
         
@@ -4304,13 +4376,15 @@ class ScannerBot:
         stats = await self.db.get_github_queue_stats()
         
         await query.edit_message_text(
-            f"GitHub Config Source\n\n"
+            f"GitHub / Sub Link Source\n\n"
             f"Status: {status}\n"
             f"Current link: {self.state.github_source_url or '-'}\n"
             f"Total in queue: {stats.get('total', 0)}\n"
             f"Remaining to send: {stats.get('remaining', 0)}\n\n"
-            f"Send a GitHub raw link to load configs from it. "
-            f"After Start, one config is sent every 30 seconds alongside the real scanner.",
+            f"Send a raw link to load configs from it (checked immediately, result reported).\n"
+            f"🔁 Saved link is auto-rechecked every 10 minutes; any new config found is "
+            f"forwarded automatically and you get notified — no need to press Start.\n"
+            f"Start button: optionally drip-sends everything currently in queue, one every 30s.",
             reply_markup=self.github_scanner_buttons()
         )
     
@@ -4349,11 +4423,13 @@ class ScannerBot:
         self.state.github_source_url = url
         
         await wait_msg.edit_text(
-            f"✅ {result['added']} کانفنیگ پیدا شد.\n\n"
+            f"✅ لینک بررسی شد.\n\n"
+            f"🆕 کانفنیگ جدید پیدا شد: {result['added']}\n"
             f"🔄 تکراری: {result['duplicate']}\n"
             f"❌ نامعتبر: {result['invalid']}\n"
-            f"📦 کل موارد داخل فایل: {result['total']}\n\n"
-            f"برای شروع ارسال (هر ۳۰ ثانیه یک کانفنیگ) دکمه START را در پنل GitHub بزنید.",
+            f"📦 کل موارد داخل لینک: {result['total']}\n\n"
+            f"برای ارسال فوری همین‌الان (هر ۳۰ ثانیه یک کانفنیگ) دکمه START را در پنل بزنید.\n"
+            f"🔁 از این به بعد این لینک هر ۱۰ دقیقه خودکار دوباره چک می‌شود و اگر کانفنیگ جدیدی اضافه شده باشد، خودکار (بدون نیاز به START) برایتان نوتیف می‌آید و فوروارد می‌شود.",
             reply_markup=self.github_scanner_buttons()
         )
     
@@ -5365,6 +5441,7 @@ class ScannerBot:
         
         self.scanner = ChannelScanner(self.state, self.db, self.user_client, self.application)
         asyncio.create_task(self.scanner.poll_forward_loop())
+        asyncio.create_task(self.scanner.github_link_auto_check_loop())
         
         # ثبت هندلرها
         self.application.add_handler(CommandHandler("start", self.start_command))
