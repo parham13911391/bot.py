@@ -28,7 +28,7 @@ from aiohttp import web
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
 API_ID = 32233583
 API_HASH = "ce6caac5e6e987ff33fc613d076570a4"
-USER_SESSION_STR = "1BJWap1sBu4O9H5rgWZl_9xxvrQU38Mdm5txmHdrqitJyIHI-hbADUBn9xODcOAhxbFNJNnbf8o3CWrXQZz2_SX4YGbTW2G_5njqpvCgu7zM62LaX7r64gi1uAVlCAyZxfMRZAhcPSjjMjSOOOZCLEYMMlx8v1KdXrpWOKqGdr1xLkAVH8JSemGbS2M5ypNHYDv-sznDmB67Q0tgRyTpO2ceLoYyy1fzAmgq10yfM8XgJPOSSAnlDwp3N87OKaBCwFEPAOF91wZc_9EmgJ2ddP5rl0HYNvdwh3ImqyHckFHnP6fVZATqzDid8sqW4v1HNznhJ6LLbAK4CVbUFDc8mxDjyAJaCwFo="
+USER_SESSION_STR = "1BJWap1wBuxBo54uf5eRvIW8RHwOqXT1cbr9Zyk-iUjVdSa9Uv27BNQh1Kt7nbHmsK4zZVildCltmSF48twpM6oVlCAeV27VVT82kvAGtBeI21dhanmIdaNgpZIqFR--BrbSJkJxzwAc1mpIA69_FWMsjMPgoUNSu3wHVFOWOh9kZcvgNO-Dkt9dOI5vZO_cLnbmVPz6EyEDe_jHC504opvTlhGl_BujiSdCXPosrvE1eEdMFolZt8jLRSecDBsG-_l7VvxzBC8aeTTuoUdp_UPQ6lLNKai9z4PRusx1gnl2KLES4vfY-qwAfR50qR4WNy-rjcYxiY7CDk0pSZwkYYKt1Q8VXZ2s="
 OWNER_ID = 8879869880
 PORT = 8080
 GROQ_API_KEY = "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"
@@ -666,7 +666,7 @@ class Database:
             invalid = 0
             
             # الگوی تشخیص کانفنیگ معتبر - فقط vless/vmess/trojan/hysteria(hy2) - ss:// دیگر پذیرفته نمی‌شود
-            valid_patterns = ['vless://', 'vmess://', 'trojan://', 'hy2://']
+            valid_patterns = ['vless://', 'vmess://', 'trojan://', 'hy2://', 'hysteria2://']
             
             for config in configs:
                 config = config.strip()
@@ -746,7 +746,7 @@ class Database:
             invalid = 0
             
             # فقط vless/vmess/trojan/hysteria(hy2) - ss:// دیگر پذیرفته نمی‌شود
-            valid_patterns = ['vless://', 'vmess://', 'trojan://', 'hy2://']
+            valid_patterns = ['vless://', 'vmess://', 'trojan://', 'hy2://', 'hysteria2://']
             
             for config in configs:
                 config = config.strip()
@@ -1052,7 +1052,7 @@ class ChannelScanner:
         self.user_client = user_client
         self.bot_app = bot_app
         # طبق درخواست: فقط vless / vmess / trojan / hysteria(hy2) فوروارد شوند - ss:// و wireguard دیگر پذیرفته نمی‌شوند
-        self.config_regex = re.compile(r"(vless://\S+|vmess://\S+|trojan://\S+|hy2://\S+)")
+        self.config_regex = re.compile(r"(vless://\S+|vmess://\S+|trojan://\S+|hy2://\S+|hysteria2://\S+)")
         self._flood_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(2)
         self._txt_sending = False
@@ -1069,34 +1069,6 @@ class ChannelScanner:
         from telethon.tl.functions.messages import ForwardMessagesRequest
         import random
         
-        for username in (CHANNEL_1_USERNAME, CHANNEL_2_USERNAME):
-            try:
-                await self.user_client(JoinChannelRequest(username))
-                logger.info(f"✅ Joined/already member of @{username}")
-            except Exception as e:
-                logger.error(f"⚠️ Could not join @{username}: {e} (اگر قبلاً عضو هستید این خطا مهم نیست)")
-        
-        # === رفع اصلیِ باگ «فوروارد نمی‌کنه» ===
-        # ForwardMessagesRequest یک درخواست خام (raw API) است و برخلاف
-        # forward_messages سطح‌بالا، خودش entity را resolve نمی‌کند. اگر
-        # GROUP_ID قبلاً هیچ‌جا (دیالوگ/پیام) توسط این سشن دیده نشده باشد،
-        # Telethon نمی‌تواند InputPeer آن را بسازد و همان خطای لاگ‌ها را
-        # می‌دهد: "Could not find the input entity for PeerChannel(...)".
-        # راه‌حل: یک‌بار در ابتدا با get_entity آن را resolve و کش می‌کنیم
-        # (و اگر نشد، یک‌بار get_dialogs کل چت‌ها را کش می‌کند).
-        group_entity = None
-        try:
-            group_entity = await self.user_client.get_entity(GROUP_ID)
-            logger.info(f"✅ Group entity resolved and cached: {GROUP_ID}")
-        except Exception as e:
-            logger.error(f"⚠️ Could not resolve group entity directly: {e} - trying get_dialogs()")
-            try:
-                await self.user_client.get_dialogs()
-                group_entity = await self.user_client.get_entity(GROUP_ID)
-                logger.info(f"✅ Group entity resolved via dialogs cache: {GROUP_ID}")
-            except Exception as e2:
-                logger.error(f"❌ Still could not resolve group entity: {e2} - forwarding will keep failing until the scanner account can see this group (must be a member).")
-        
         # بازیابی آخرین آیدی فوروارد شده از دیتابیس (برای اینکه بعد از ری‌استارت
         # دوباره پیام‌های قدیمی را فوروارد نکند)
         last_id_str = await self.db.get_scanner_state("last_forwarded_config_msg_id")
@@ -1107,10 +1079,16 @@ class ChannelScanner:
         
         logger.info(f"👂 Poll-forwarder started for @{CHANNEL_1_USERNAME} -> topic {CONFIG_TOPIC_ID} (هر ۱۰ ثانیه)")
         
+        # این‌ها یک‌بار برای هر «نمونهٔ کلاینت» ست می‌شوند، نه یک‌بار برای کل
+        # عمر برنامه - چون وقتی از /start لاگین مجدد انجام شود، self.user_client
+        # با یک آبجکت کاملاً جدید عوض می‌شود و باید join/resolve دوباره انجام شود.
+        bound_client = None
+        group_entity = None
+        
         consecutive_errors = 0
         while True:
             try:
-                if self.state.session_needs_login:
+                if self.state.session_needs_login or self.user_client is None:
                     await asyncio.sleep(10)
                     continue
                 
@@ -1119,11 +1097,37 @@ class ChannelScanner:
                     # "Cannot send requests while disconnected" پشت سر هم می‌آید
                     await self.user_client.connect()
                 
-                if group_entity is None:
+                if bound_client is not self.user_client:
+                    # کلاینت عوض شده (مثلاً لاگین مجدد انجام شد) - همه‌چیز را
+                    # برای این نمونهٔ جدید دوباره resolve می‌کنیم.
+                    bound_client = self.user_client
+                    group_entity = None
+                    for username in (CHANNEL_1_USERNAME, CHANNEL_2_USERNAME):
+                        try:
+                            await bound_client(JoinChannelRequest(username))
+                            logger.info(f"✅ Joined/already member of @{username}")
+                        except Exception as e:
+                            logger.error(f"⚠️ Could not join @{username}: {e} (اگر قبلاً عضو هستید این خطا مهم نیست)")
+                    
+                    # === رفع اصلیِ باگ «فوروارد نمی‌کنه» ===
+                    # ForwardMessagesRequest یک درخواست خام (raw API) است و برخلاف
+                    # forward_messages سطح‌بالا، خودش entity را resolve نمی‌کند. اگر
+                    # GROUP_ID قبلاً هیچ‌جا (دیالوگ/پیام) توسط این سشن دیده نشده باشد،
+                    # Telethon نمی‌تواند InputPeer آن را بسازد و همان خطای لاگ‌ها را
+                    # می‌دهد: "Could not find the input entity for PeerChannel(...)".
+                    # راه‌حل: یک‌بار در ابتدا با get_entity آن را resolve و کش می‌کنیم
+                    # (و اگر نشد، یک‌بار get_dialogs کل چت‌ها را کش می‌کند).
                     try:
-                        group_entity = await self.user_client.get_entity(GROUP_ID)
-                    except Exception:
-                        pass
+                        group_entity = await bound_client.get_entity(GROUP_ID)
+                        logger.info(f"✅ Group entity resolved and cached: {GROUP_ID}")
+                    except Exception as e:
+                        logger.error(f"⚠️ Could not resolve group entity directly: {e} - trying get_dialogs()")
+                        try:
+                            await bound_client.get_dialogs()
+                            group_entity = await bound_client.get_entity(GROUP_ID)
+                            logger.info(f"✅ Group entity resolved via dialogs cache: {GROUP_ID}")
+                        except Exception as e2:
+                            logger.error(f"❌ Still could not resolve group entity: {e2} - forwarding will keep failing until the scanner account can see this group (must be a member).")
                 
                 if self.state.send_to_topic_enabled and group_entity is not None:
                     messages = await self.user_client.get_messages(CHANNEL_1_USERNAME, limit=1)
@@ -1198,7 +1202,7 @@ class ChannelScanner:
             return []
         
         # فقط vless/vmess/trojan/hysteria(hy2) - ss:// و wireguard دیگر استخراج/ارسال نمی‌شوند
-        pattern = r'(vless://[^\s]+|vmess://[^\s]+|trojan://[^\s]+|hy2://[^\s]+)'
+        pattern = r'(vless://[^\s]+|vmess://[^\s]+|trojan://[^\s]+|hy2://[^\s]+|hysteria2://[^\s]+)'
         return re.findall(pattern, text)
     
     async def extract_configs_from_file(self, file_content: bytes) -> List[str]:
@@ -1311,7 +1315,7 @@ class ChannelScanner:
         if not config_text:
             return False
         # طبق درخواست: ss:// دیگر معتبر نیست، فقط vless/vmess/trojan/hysteria(hy2)
-        valid_protocols = ['vless://', 'vmess://', 'trojan://', 'hy2://']
+        valid_protocols = ['vless://', 'vmess://', 'trojan://', 'hy2://', 'hysteria2://']
         return any(config_text.startswith(p) for p in valid_protocols)
     
     def is_proxy_link(self, url: str) -> bool:
@@ -1608,19 +1612,18 @@ class ChannelScanner:
                 logger.info(f"⏭️ Proxy already sent: {proxy_hash[:10]}...")
                 return True
             
-            # طبق درخواست: قبلاً لینک پروکسی فقط داخل دکمه بود و درست
-            # کپی نمی‌شد (چون داخل URL دکمه، کاراکترهای encode‌شده مثل
-            # سکرت به‌درستی قابل کپی نبودند). حالا لینک کامل را هم داخل
-            # یک بلاک کد HTML (<code>) می‌گذاریم تا با یک لمس، دقیقاً و
-            # کامل کپی شود.
             channel_message = f"""now proxy ⚡️
-
-<code>{html.escape(proxy_url)}</code>
 
 📍 Location: {flag} {html.escape(info.get('country', 'Unknown'))}
 
 @v2reya88 | @confinghub2"""
             
+            # طبق درخواست: لینک فقط داخل دکمه بماند (نه بلاک کد). لینک
+            # proxy_url دقیقاً همان چیزی است که از کانال منبع خونده شده و
+            # بدون هیچ تغییر/انکود دوباره‌ای مستقیم داخل URL دکمه گذاشته
+            # می‌شود، پس سکرت داخلش دست‌نخورده و کامل است. اگر تلگرام
+            # دکمه را long-press کنی و «Copy Link» را بزنی، دقیقاً همین
+            # لینک کامل (با سکرت) کپی می‌شود.
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("CONNECT", url=proxy_url, style="primary"),
@@ -1993,7 +1996,7 @@ class ChannelScanner:
             configs = await self.extract_configs_from_text(text_content)
             
             if not configs:
-                await message.reply_text("❌ هیچ کانفنیگ معتبری در فایل پیدا نشد!\n\nپروتکل‌های پشتیبانی شده:\n• vless://\n• vmess://\n• trojan://\n• ss://\n• hy2://\n• wireguard://")
+                await message.reply_text("❌ هیچ کانفنیگ معتبری در فایل پیدا نشد!\n\nپروتکل‌های پشتیبانی شده:\n• vless://\n• vmess://\n• trojan://\n• hy2:// / hysteria2://")
                 return
             
             # اضافه کردن به صف
@@ -2035,6 +2038,7 @@ class ScannerBot:
         self.ai = AIManager(GROQ_API_KEY, self.state)
         self.application = None
         self.user_client = None
+        self.login_client = None
         self.scanner = None
         self._error_handler_registered = False
         
@@ -2703,7 +2707,7 @@ class ScannerBot:
         await query.edit_message_text(
             f"📤 **ارسال به تاپیک**\n\nوضعیت: {status}\n\n"
             f"با روشن بودن این گزینه، کانفنیگ‌ها و پروکسی‌ها به تاپیک گروه نیز ارسال می‌شوند.\n"
-            f"⚠️ فقط کانفنیگ‌های معتبر (vless://, vmess://, trojan://, ss://, hy2://, wireguard://) فورارد می‌شوند.",
+            f"⚠️ فقط کانفنیگ‌های معتبر (vless://, vmess://, trojan://, hy2://, hysteria2://) فوروارد می‌شوند. ss:// دیگر فوروارد نمی‌شود.",
             reply_markup=self.topic_buttons(),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -2829,7 +2833,7 @@ class ScannerBot:
             "• کانفنیگ‌های تکراری شناسایی می‌شوند\n"
             "• کانفنیگ‌های نامعتبر نادیده گرفته می‌شوند\n\n"
             "🔹 پروتکل‌های پشتیبانی شده:\n"
-            "• vless://\n• vmess://\n• trojan://\n• ss://\n• hy2://\n• wireguard://",
+            "• vless://\n• vmess://\n• trojan://\n• hy2:// / hysteria2://",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_txt_scanner", style="danger")]
             ]),
@@ -4581,10 +4585,25 @@ class ScannerBot:
         wait_msg = await message.reply_text("🔄 در حال ارسال کد تایید...")
         
         try:
-            if not self.user_client.is_connected():
-                await self.user_client.connect()
+            # === رفع اصلیِ باگ «خطا در ارسال کد» ===
+            # قبلاً send_code_request روی self.user_client (همان سشن قدیمیِ
+            # از کار افتاده) صدا زده می‌شد. وقتی تلگرام یک سشن را به‌خاطر
+            # استفادهٔ همزمان از دو IP باطل می‌کند، پیام صریح می‌گوید
+            # "can no longer be used" - یعنی آن authkey برای همیشه مرده و
+            # هیچ retry ای روی همان کلاینت جواب نمی‌دهد. راه‌حل درست این
+            # است که برای فرایند لاگین یک کلاینت کاملاً تازه با سشن خالی
+            # بسازیم (self.login_client)، و فقط در صورت موفقیت کامل، آن را
+            # جایگزین self.user_client قدیمی کنیم.
+            if self.login_client:
+                try:
+                    await self.login_client.disconnect()
+                except Exception:
+                    pass
             
-            sent = await self.user_client.send_code_request(phone)
+            self.login_client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await self.login_client.connect()
+            
+            sent = await self.login_client.send_code_request(phone)
             self.state.login_phone = phone
             self.state.login_phone_code_hash = sent.phone_code_hash
             context.user_data['waiting_for_login_code'] = True
@@ -4610,7 +4629,7 @@ class ScannerBot:
             from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
             
             try:
-                await self.user_client.sign_in(
+                await self.login_client.sign_in(
                     phone=self.state.login_phone,
                     code=code,
                     phone_code_hash=self.state.login_phone_code_hash
@@ -4636,7 +4655,7 @@ class ScannerBot:
         wait_msg = await message.reply_text("🔄 در حال بررسی رمز...")
         
         try:
-            await self.user_client.sign_in(password=password)
+            await self.login_client.sign_in(password=password)
             await self._finish_session_login(update, wait_msg)
         except Exception as e:
             logger.error(f"❌ 2FA sign_in error: {e}")
@@ -4644,10 +4663,25 @@ class ScannerBot:
     
     async def _finish_session_login(self, update: Update, wait_msg):
         """بعد از موفقیت لاگین: سشن جدید را در دیتابیس ذخیره می‌کند (تا بعد
-        از ری‌استارت هم بدون نیاز به ادیت کد باقی بماند)، اسکنرهای متوقف‌شده
-        را دوباره روشن می‌کند و رشتهٔ سشن جدید را برای ادمین می‌فرستد."""
-        new_session_str = self.user_client.session.save()
+        از ری‌استارت هم بدون نیاز به ادیت کد باقی بماند)، کلاینت اصلی ربات
+        را با کلاینت تازه‌لاگین‌شده عوض می‌کند، اسکنرهای متوقف‌شده را دوباره
+        روشن می‌کند و رشتهٔ سشن جدید را برای ادمین می‌فرستد."""
+        new_session_str = self.login_client.session.save()
         await self.db.set_scanner_state("user_session_string", new_session_str)
+        
+        # سشن قدیمی (که مرده/باطل بود) را قطع کن و کلاینت اصلی را با
+        # کلاینت تازه‌لاگین‌شده جایگزین کن. poll_forward_loop خودش تشخیص
+        # می‌دهد که self.user_client عوض شده و entity ها را دوباره resolve
+        # می‌کند.
+        old_client = self.user_client
+        self.user_client = self.login_client
+        self.login_client = None
+        
+        if old_client is not None and old_client is not self.user_client:
+            try:
+                await old_client.disconnect()
+            except Exception:
+                pass
         
         self.state.session_needs_login = False
         self.state.login_phone = None
