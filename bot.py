@@ -19,6 +19,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import ChatAdminRequiredError, UserNotParticipantError, RPCError, FloodWaitError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 from telegram.request import HTTPXRequest
@@ -32,6 +33,7 @@ USER_SESSION_STR = "1BJWap1sBu4O9H5rgWZl_9xxvrQU38Mdm5txmHdrqitJyIHI-hbADUBn9xOD
 OWNER_ID = 8879869880
 PORT = 8080
 GROQ_API_KEY = "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"
+GITHUB_API_TOKEN = os.environ.get('GITHUB_API_TOKEN', "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")
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 RAILWAY_URL = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
 WEBHOOK_URL = f"https://{RAILWAY_URL}/webhook" if RAILWAY_URL else ""
@@ -1282,7 +1284,54 @@ class ChannelScanner:
         
         return None
     
-    def extract_proxy_host(self, proxy_url: str) -> Optional[str]:
+    async def extract_port(self, config_text: str) -> Optional[int]:
+        """پورت واقعی سرور را از داخل کانفنیگ استخراج می‌کند (برای تست سلامت)."""
+        try:
+            if config_text.startswith('vmess://'):
+                import base64
+                raw = config_text[len('vmess://'):].split('#')[0].strip()
+                raw += '=' * (-len(raw) % 4)
+                decoded = base64.b64decode(raw).decode('utf-8', errors='ignore')
+                data = json.loads(decoded)
+                port = data.get('port')
+                if port:
+                    return int(port)
+        except Exception:
+            pass
+        
+        m = re.search(r'@[^:/?#@]+:(\d+)', config_text)
+        if m:
+            return int(m.group(1))
+        
+        m = re.search(r'([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):(\d+)', config_text)
+        if m:
+            return int(m.group(2))
+        
+        return None
+    
+    async def is_config_alive(self, host: Optional[str], port: Optional[int], timeout: float = 3.0) -> bool:
+        """تست سلامت واقعی: تلاش برای برقراری اتصال TCP به سرور کانفنیگ.
+        طبق درخواست شما، فقط کانفنیگ‌هایی که واقعاً سالم/در‌دسترس هستند
+        فوروارد می‌شوند - نه هر چیزی که فقط از نظر فرمت معتبر باشد."""
+        if not host or not port:
+            return False
+        
+        # آدرس‌های محلی/بی‌معنی (مثل 127.0.0.1 که گاهی به‌اشتباه در
+        # کانفنیگ‌های ناقص/تستی دیده می‌شود) هرگز یک سرور واقعی نیستند
+        if host in ('127.0.0.1', 'localhost', '0.0.0.0', '::1'):
+            return False
+        
+        try:
+            fut = asyncio.open_connection(host, port)
+            reader, writer = await asyncio.wait_for(fut, timeout=timeout)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
         """آدرس واقعی سرور پروکسی (نه IP خود ربات) را از لینک t.me/proxy استخراج می‌کند."""
         m = re.search(r'[?&]server=([^&\s]+)', proxy_url)
         if m:
@@ -1531,6 +1580,18 @@ class ChannelScanner:
     async def send_config(self, config_text: str, source_channel: str = None) -> bool:
         try:
             host = await self.extract_host(config_text)
+            port = await self.extract_port(config_text)
+            
+            # === طبق درخواست: فقط کانفنیگ‌های سالم فوروارد شوند ===
+            # قبل از فرستادن، واقعاً تست می‌کنیم که سرور کانفنیگ روی
+            # آدرس:پورتش جواب می‌ده یا نه (نه فقط اینکه فرمتش درسته).
+            # کانفنیگ‌های مرده/آفلاین (که باعث خطاهای ip-api هم می‌شدند)
+            # دیگر اصلاً فوروارد نمی‌شوند.
+            is_alive = await self.is_config_alive(host, port)
+            if not is_alive:
+                logger.info(f"⏭️ Skipping dead/unreachable config: {host}:{port}")
+                return False
+            
             location = await self.get_ip_info(host) if host else {'ip': 'Unknown', 'country': 'Unknown', 'city': 'Unknown'}
             flag = self.get_country_flag(location.get('countryCode', ''))
             
@@ -1755,6 +1816,141 @@ class ChannelScanner:
         result = await self.db.add_github_configs_to_queue(configs, source_url=url)
         result['ok'] = True
         return result
+    
+    async def scan_github_topic(self, topic: str = "v2ray-config") -> Dict:
+        """کل گیت‌هاب را برای مخازن با این تاپیک می‌گردد، تمام فایل‌های
+        محتمل (README, txt, yaml, json, sub...) هر مخزن را می‌خواند و هر
+        کانفنیگ جدیدی که پیدا کند به همان صف گیت‌هاب (github_queue) اضافه
+        می‌کند - بدون پاک کردن صف قبلی (چون این یک اسکن خودکار/دوره‌ای است،
+        نه ارسال یک لینک تازه توسط ادمین)."""
+        if not GITHUB_API_TOKEN:
+            logger.error("❌ GITHUB_API_TOKEN not set - skipping topic scan")
+            return {'ok': False, 'error': 'no token', 'found': 0, 'repos_scanned': 0}
+        
+        headers = {
+            "Authorization": f"Bearer {GITHUB_API_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "v2ray-config-scanner"
+        }
+        
+        all_configs = []
+        repos_scanned = 0
+        
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                # ۱) لیست مخازن با تاپیک v2ray-config (جدیدترین‌ها اول)
+                search_url = f"https://api.github.com/search/repositories?q=topic:{topic}&sort=updated&order=desc&per_page=30"
+                async with session.get(search_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        logger.error(f"❌ GitHub search API error {resp.status}: {err[:200]}")
+                        return {'ok': False, 'error': f"HTTP {resp.status}", 'found': 0, 'repos_scanned': 0}
+                    data = await resp.json()
+                    repos = data.get('items', [])
+                
+                # حداکثر ۲۰ مخزن در هر اسکن (برای رعایت rate limit و سرعت)
+                for repo in repos[:20]:
+                    full_name = repo.get('full_name')
+                    default_branch = repo.get('default_branch', 'main')
+                    if not full_name:
+                        continue
+                    
+                    try:
+                        tree_url = f"https://api.github.com/repos/{full_name}/git/trees/{default_branch}?recursive=1"
+                        async with session.get(tree_url, timeout=aiohttp.ClientTimeout(total=15)) as tresp:
+                            if tresp.status != 200:
+                                continue
+                            tree_data = await tresp.json()
+                            files = tree_data.get('tree', [])
+                    except Exception as e:
+                        logger.error(f"⚠️ GitHub tree fetch failed for {full_name}: {e}")
+                        continue
+                    
+                    # فقط فایل‌های محتمل برای داشتن کانفنیگ (نه کل مخزن -
+                    # سریع‌تر و کم‌مصرف‌تر از نظر rate limit)
+                    candidate_exts = ('.txt', '.yaml', '.yml', '.json', '.md', '.conf', '.sub')
+                    candidate_names = ('sub', 'config', 'readme', 'v2ray', 'clash', 'nodes', 'list')
+                    picked = []
+                    for f in files:
+                        if f.get('type') != 'blob':
+                            continue
+                        path = f.get('path', '')
+                        low = path.lower()
+                        if low.endswith(candidate_exts) or any(n in low for n in candidate_names):
+                            picked.append(path)
+                    picked = picked[:10]  # حداکثر ۱۰ فایل برای هر مخزن
+                    
+                    repo_configs = []
+                    for path in picked:
+                        raw_url = f"https://raw.githubusercontent.com/{full_name}/{default_branch}/{path}"
+                        try:
+                            async with session.get(raw_url, timeout=aiohttp.ClientTimeout(total=15)) as rresp:
+                                if rresp.status != 200:
+                                    continue
+                                text = await rresp.text(errors='ignore')
+                        except Exception:
+                            continue
+                        
+                        found = await self.extract_configs_from_text(text)
+                        if not found:
+                            try:
+                                # خیلی از فایل‌های ساب base64 کل فایل هستند
+                                import base64
+                                decoded = base64.b64decode(text.strip() + '=' * (-len(text.strip()) % 4)).decode('utf-8', errors='ignore')
+                                found = await self.extract_configs_from_text(decoded)
+                            except Exception:
+                                pass
+                        repo_configs.extend(found)
+                    
+                    if repo_configs:
+                        all_configs.extend(repo_configs)
+                    repos_scanned += 1
+        except Exception as e:
+            logger.error(f"❌ GitHub topic scan error: {e}")
+            return {'ok': False, 'error': str(e), 'found': 0, 'repos_scanned': repos_scanned}
+        
+        # جدیدترین‌ها اول
+        all_configs = list(reversed(all_configs))
+        result = await self.db.add_github_configs_to_queue(all_configs, source_url=f"github-topic:{topic}")
+        result['ok'] = True
+        result['repos_scanned'] = repos_scanned
+        result['found'] = result.get('added', 0)
+        return result
+    
+    async def github_topic_scan_loop(self):
+        """هر ۱ ساعت یک‌بار کل گیت‌هاب را برای تاپیک v2ray-config می‌گردد،
+        کانفنیگ‌های جدید را به صف گیت‌هاب اضافه می‌کند (بدون فرستادن خودکار -
+        فرستادن فقط با زدن دکمه START توسط ادمین انجام می‌شود) و یک گزارش
+        برای ادمین‌ها می‌فرستد که چند کانفنیگ جدید پیدا شده."""
+        if not GITHUB_API_TOKEN:
+            logger.info("ℹ️ GITHUB_API_TOKEN not set - GitHub topic auto-scan disabled.")
+            return
+        
+        logger.info("🐙 GitHub topic auto-scanner started (هر ۱ ساعت)")
+        while True:
+            try:
+                result = await self.scan_github_topic()
+                if result.get('ok'):
+                    logger.info(f"🐙 GitHub topic scan done: {result.get('added', 0)} new, {result.get('repos_scanned', 0)} repos scanned")
+                    for admin_id in self.state.admins:
+                        try:
+                            await self.bot_app.bot.send_message(
+                                admin_id,
+                                f"🐙 اسکن خودکار گیت‌هاب (v2ray-config) انجام شد:\n\n"
+                                f"📦 مخازن بررسی‌شده: {result.get('repos_scanned', 0)}\n"
+                                f"🆕 کانفنیگ جدید پیدا/اضافه شد: {result.get('added', 0)}\n"
+                                f"🔄 تکراری: {result.get('duplicate', 0)}\n\n"
+                                f"برای ارسال، وارد پنل گیت‌هاب شو و START را بزن."
+                            )
+                        except Exception as e:
+                            logger.error(f"⚠️ Could not notify admin {admin_id}: {e}")
+                else:
+                    logger.error(f"❌ GitHub topic scan failed: {result.get('error')}")
+            except Exception as e:
+                logger.error(f"❌ GitHub topic scan loop error: {e}")
+            
+            await asyncio.sleep(3600)  # هر ۱ ساعت
     
     async def process_github_configs(self):
         """ارسال کانفنیگ‌های صف گیت‌هاب - هر ۳۰ ثانیه یکی، مستقل از اسکنر واقعی.
@@ -2059,6 +2255,17 @@ class ScannerBot:
         self.login_client = None
         self.scanner = None
         self._error_handler_registered = False
+    
+    async def safe_edit_message_text(self, query, text, **kwargs):
+        """مثل query.edit_message_text ولی اگر متن/دکمه‌ها دقیقاً همون قبلی
+        باشه (خطای بی‌ضرر Message is not modified که تو لاگ‌ها می‌افتاد)
+        فقط بی‌صدا نادیده می‌گیرتش، نه اینکه Exception پرت کنه."""
+        try:
+            await query.edit_message_text(text, **kwargs)
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                return
+            raise
         
         self.TEXTS = {
             "fa": {
@@ -2722,7 +2929,8 @@ class ScannerBot:
         
         await query.answer()
         status = "🟢 روشن" if self.state.send_to_topic_enabled else "🔴 خاموش"
-        await query.edit_message_text(
+        await self.safe_edit_message_text(
+            query,
             f"📤 **ارسال به تاپیک**\n\nوضعیت: {status}\n\n"
             f"با روشن بودن این گزینه، کانفنیگ‌ها و پروکسی‌ها به تاپیک گروه نیز ارسال می‌شوند.\n"
             f"⚠️ فقط کانفنیگ‌های معتبر (vless://, vmess://, trojan://, hy2://, hysteria2://) فوروارد می‌شوند. ss:// دیگر فوروارد نمی‌شود.",
@@ -4533,7 +4741,8 @@ class ScannerBot:
         stats = await self.db.get_github_queue_stats()
         
         # طبق درخواست: فقط تعداد کانفنیگ موجود و تعداد ارسال‌شده نمایش داده شود
-        await query.edit_message_text(
+        await self.safe_edit_message_text(
+            query,
             f"📦 کانفنیگ موجود: {stats.get('remaining', 0)}\n"
             f"📤 کانفنیگ ارسال‌شده: {stats.get('sent', 0)}",
             reply_markup=self.github_scanner_buttons()
@@ -5767,6 +5976,7 @@ class ScannerBot:
         self.scanner = ChannelScanner(self.state, self.db, self.user_client, self.application)
         asyncio.create_task(self.scanner.poll_forward_loop())
         asyncio.create_task(self.scanner.github_link_auto_check_loop())
+        asyncio.create_task(self.scanner.github_topic_scan_loop())
         
         # ثبت هندلرها
         self.application.add_handler(CommandHandler("start", self.start_command))
