@@ -29,7 +29,7 @@ from aiohttp import web
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
 API_ID = 31809598
 API_HASH = "9df12f1fa837a291683e8c5802d82e72"
-USER_SESSION_STR = "1BJWap1wBu16NY_0HcarsQWtZQdZsHvqR22Y9Myy78bTxIADm7h_Xrfn-yzCgp8dwpXhqPrRyoOv3R5RAyqaKBvDbya4f3V-bwFoI0cpYR6SXly2_kbJv3S9VRkoZI5PfPT-wHWBGiRulDXjAqnC8pNYVkJnd7VpCQ_jXRw-NaHhLnLdQ-sdWIU0DlX0mfzk_qZVMlfqSu8831cgdTFmkgBjTsP2YSobS2nN3SrDRvlUXUWknpfkyGjwqPd4s49EuDStDcYPJ60VbjWfb-Fwca_CtAWRx4FCEfH2oXlWkZvxRKCSQCXrWxuoxtlCH2OLONYHkTOkE_sfXbckIjTl5k2e-NdEuZkU="
+USER_SESSION_STR = ""  # طبق درخواست: سشنِ قدیمیِ غیرفعال حذف شد - سشن واقعی همیشه از دیتابیس (ست‌شده توسط لاگین از داخل خود ربات) خونده می‌شه
 OWNER_ID = 8879869880
 PORT = 8080
 GROQ_API_KEY = "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"
@@ -1332,29 +1332,39 @@ class ChannelScanner:
         
         return None
     
-    async def is_config_alive(self, host: Optional[str], port: Optional[int], timeout: float = 3.0) -> bool:
-        """تست سلامت واقعی: تلاش برای برقراری اتصال TCP به سرور کانفنیگ.
-        طبق درخواست شما، فقط کانفنیگ‌هایی که واقعاً سالم/در‌دسترس هستند
-        فوروارد می‌شوند - نه هر چیزی که فقط از نظر فرمت معتبر باشد."""
+    async def check_config_health(self, host: Optional[str], port: Optional[int], timeout: float = 3.0) -> Tuple[bool, Optional[int]]:
+        """تست سلامت واقعی + اندازه‌گیری پینگ (round-trip زمان برقراری
+        اتصال TCP به‌جای ICMP، چون تو کانتینر معمولاً دسترسی به ping خام
+        نیست - ولی برای این هدف همون‌قدر معتبره).
+        طبق درخواست «ضد خرابی بیشتر»: به‌جای یک تلاش تک، ۲ بار با فاصلهٔ کم
+        امتحان می‌کنیم تا یک قطعی موقتی/گذرا باعث نشه یه کانفنیگ سالم به
+        اشتباه «مرده» تشخیص داده بشه. کافیه یکی از دو تلاش موفق باشه."""
         if not host or not port:
-            return False
+            return False, None
         
-        # آدرس‌های محلی/بی‌معنی (مثل 127.0.0.1 که گاهی به‌اشتباه در
-        # کانفنیگ‌های ناقص/تستی دیده می‌شود) هرگز یک سرور واقعی نیستند
+        # آدرس‌های محلی/بی‌معنی هرگز یک سرور واقعی نیستند
         if host in ('127.0.0.1', 'localhost', '0.0.0.0', '::1'):
-            return False
+            return False, None
         
-        try:
-            fut = asyncio.open_connection(host, port)
-            reader, writer = await asyncio.wait_for(fut, timeout=timeout)
-            writer.close()
+        for attempt in range(2):
             try:
-                await writer.wait_closed()
+                start = time.monotonic()
+                fut = asyncio.open_connection(host, port)
+                reader, writer = await asyncio.wait_for(fut, timeout=timeout)
+                ping_ms = int((time.monotonic() - start) * 1000)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return True, ping_ms
             except Exception:
-                pass
-            return True
-        except Exception:
-            return False
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+                continue
+        return False, None
+    
+    def extract_proxy_host(self, proxy_url: str) -> Optional[str]:
         """آدرس واقعی سرور پروکسی (نه IP خود ربات) را از لینک t.me/proxy استخراج می‌کند."""
         m = re.search(r'[?&]server=([^&\s]+)', proxy_url)
         if m:
@@ -1365,9 +1375,15 @@ class ChannelScanner:
         """اطلاعات لوکیشن یک IP/دامنه مشخص را برمی‌گرداند. اگر ip داده نشود و
         allow_self_lookup=False باشد (پیش‌فرض)، به‌جای گرفتن لوکیشن IP خود
         سرور ربات (که باعث نمایش لوکیشن غلط/فیک برای کانفنیگ‌ها می‌شد)،
-        مستقیماً Unknown برمی‌گردد."""
+        مستقیماً Unknown برمی‌گردد.
+        
+        برای دقتِ بیشتر، اگر ارائه‌دهندهٔ اصلی (ip-api.com) جواب نداد یا
+        rate-limit شد، خودکار یک ارائه‌دهندهٔ پشتیبان (ipwho.is) را هم
+        امتحان می‌کند - به‌جای اینکه فوراً Unknown برگردد."""
         if not ip and not allow_self_lookup:
             return {'ip': 'Unknown', 'country': 'Unknown', 'countryCode': '', 'city': 'Unknown', 'region': 'Unknown', 'isp': 'Unknown'}
+        
+        # ارائه‌دهندهٔ اول: ip-api.com
         try:
             url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,isp,query" if ip else "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,isp,query"
             async with aiohttp.ClientSession() as session:
@@ -1387,6 +1403,27 @@ class ChannelScanner:
                             logger.error(f"ip-api lookup failed for '{ip}': {data.get('message', data)}")
         except Exception as e:
             logger.error(f"get_ip_info error for '{ip}': {e}")
+        
+        # ارائه‌دهندهٔ پشتیبان: ipwho.is (اگه اولی جواب نداد/rate-limit شد)
+        if ip:
+            try:
+                url2 = f"https://ipwho.is/{ip}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url2, timeout=aiohttp.ClientTimeout(total=6)) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if data.get('success', False):
+                                return {
+                                    'ip': data.get('ip', ip),
+                                    'country': data.get('country', 'Unknown'),
+                                    'countryCode': data.get('country_code', ''),
+                                    'city': data.get('city', 'Unknown'),
+                                    'region': data.get('region', 'Unknown'),
+                                    'isp': (data.get('connection') or {}).get('isp', 'Unknown')
+                                }
+            except Exception as e:
+                logger.error(f"get_ip_info fallback (ipwho.is) error for '{ip}': {e}")
+        
         return {'ip': ip or 'Unknown', 'country': 'Unknown', 'countryCode': '', 'city': 'Unknown', 'region': 'Unknown', 'isp': 'Unknown'}
     
     def get_country_flag(self, country_code: str) -> str:
@@ -1605,12 +1642,12 @@ class ChannelScanner:
             host = await self.extract_host(config_text)
             port = await self.extract_port(config_text)
             
-            # === طبق درخواست: فقط کانفنیگ‌های سالم فوروارد شوند ===
+            # === طبق درخواست: فقط کانفنیگ‌های سالم فوروارد شوند + پینگ واقعی ===
             # قبل از فرستادن، واقعاً تست می‌کنیم که سرور کانفنیگ روی
-            # آدرس:پورتش جواب می‌ده یا نه (نه فقط اینکه فرمتش درسته).
-            # کانفنیگ‌های مرده/آفلاین (که باعث خطاهای ip-api هم می‌شدند)
-            # دیگر اصلاً فوروارد نمی‌شوند.
-            is_alive = await self.is_config_alive(host, port)
+            # آدرس:پورتش جواب می‌ده یا نه (نه فقط اینکه فرمتش درسته)، با ۲
+            # تلاش (ضد خرابی/false-negative گذرا) و اندازه‌گیری پینگ واقعی.
+            # کانفنیگ‌های مرده/آفلاین دیگر اصلاً فوروارد نمی‌شوند.
+            is_alive, ping_ms = await self.check_config_health(host, port)
             if not is_alive:
                 logger.info(f"⏭️ Skipping dead/unreachable config: {host}:{port}")
                 return False
@@ -1636,12 +1673,14 @@ class ChannelScanner:
             # یک بلاک کد، تلگرام هیچ نشانه‌ی مارک‌داون دیگری (_ * و...) را
             # پردازش نمی‌کند، پس مشکل قبلیِ نصفه‌ارسالی از این مسیر رخ نمی‌دهد.
             safe_config_text = config_text.replace('`', "'")
+            ping_line = f"⚡️ Ping: {ping_ms}ms" if ping_ms is not None else "⚡️ Ping: -"
             message = f"""```
 {safe_config_text}
 ```
 
 📍 Location: {flag} {location.get('country', 'Unknown')}
 🏙️ City: {location.get('city', 'Unknown')}
+{ping_line}
 
 @v2reya88 | @confinghub2"""
             
@@ -1700,6 +1739,15 @@ class ChannelScanner:
     async def send_proxy(self, proxy_url: str, source_channel: str = None) -> bool:
         try:
             proxy_host = self.extract_proxy_host(proxy_url)
+            m_port = re.search(r'[?&]port=(\d+)', proxy_url)
+            proxy_port = int(m_port.group(1)) if m_port else 443
+            
+            # طبق درخواست: تست سلامت + پینگ برای پروکسی هم اعمال شود
+            is_alive, ping_ms = await self.check_config_health(proxy_host, proxy_port)
+            if not is_alive:
+                logger.info(f"⏭️ Skipping dead/unreachable proxy: {proxy_host}:{proxy_port}")
+                return False
+            
             info = await self.get_ip_info(proxy_host)
             flag = self.get_country_flag(info.get('countryCode', ''))
             
@@ -1709,9 +1757,11 @@ class ChannelScanner:
                 logger.info(f"⏭️ Proxy already sent: {proxy_hash[:10]}...")
                 return True
             
+            ping_line = f"⚡️ Ping: {ping_ms}ms" if ping_ms is not None else ""
             channel_message = f"""now proxy ⚡️
 
 📍 Location: {flag} {html.escape(info.get('country', 'Unknown'))}
+{ping_line}
 
 @v2reya88 | @confinghub2"""
             
@@ -2469,6 +2519,9 @@ class ScannerBot:
                     InlineKeyboardButton("GitHub", callback_data="admin_github", style="danger")
                 ],
                 [
+                    InlineKeyboardButton("🔑 سشن‌ها (فقط مالک)", callback_data="admin_sessions", style="danger")
+                ],
+                [
                     InlineKeyboardButton("⬅️ صفحه قبل", callback_data="admin_panel_page_1", style="primary"),
                     InlineKeyboardButton("بازگشت", callback_data="back_main", style="danger")
                 ]
@@ -2941,6 +2994,97 @@ class ScannerBot:
                     [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="danger")]
                 ])
             )
+    
+    # ==================== سشن‌ها (فقط مالک) ====================
+    async def admin_sessions_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """طبق درخواست: فقط مالک اصلی (نه ادمین‌های دیگه) می‌تونه سشن فعلی
+        اکانت اسکنر رو ببینه و/یا دوباره لاگین کنه تا سشن جدید ساخته و
+        خودکار ذخیره بشه. سشن قدیمیِ هاردکد‌شده تو کد حذف شده - از این به
+        بعد تنها منبع سشن، همین لاگینِ داخل ربات و دیتابیسه."""
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_owner(user_id):
+            await query.answer("این بخش فقط برای مالک ربات است!", show_alert=True)
+            return
+        
+        await query.answer()
+        
+        saved_session = await self.db.get_scanner_state("user_session_string")
+        has_session = bool(saved_session and saved_session != "False")
+        
+        text_lines = ["🔑 **مدیریت سشن اکانت اسکنر**\n"]
+        
+        if self.state.session_needs_login or self.user_client is None or not has_session:
+            text_lines.append("🔴 وضعیت: سشن فعال/معتبری وجود ندارد.")
+            text_lines.append("برای ساخت سشن جدید، روی «ورود / ساخت سشن جدید» بزن، شماره و کدی که تلگرام می‌فرسته رو وارد کن - سشن خودکار ساخته و ذخیره می‌شه.")
+        else:
+            try:
+                me = await self.user_client.get_me()
+                text_lines.append("🟢 وضعیت: متصل و فعال")
+                text_lines.append(f"👤 اکانت: @{me.username if me and me.username else 'بدون‌یوزرنیم'} ({me.id if me else '?'})")
+            except Exception:
+                text_lines.append("🟡 وضعیت: سشن ذخیره شده ولی الان قابل تایید نیست (احتمالاً قطع/در حال ری‌کانکت)")
+            
+            masked = saved_session[:10] + "..." + saved_session[-10:] if len(saved_session) > 24 else "***"
+            text_lines.append(f"\n🔒 سشن (خلاصه‌شده): `{masked}`")
+            text_lines.append("برای دیدن رشتهٔ کامل سشن (برای بکاپ)، روی دکمهٔ زیر بزن.")
+        
+        keyboard = [
+            [InlineKeyboardButton("🔐 ورود / ساخت سشن جدید", callback_data="session_relogin", style="success")]
+        ]
+        if has_session:
+            keyboard.append([InlineKeyboardButton("👁️ نمایش کامل سشن", callback_data="session_show_full", style="danger")])
+        keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_page_2", style="primary")])
+        
+        await self.safe_edit_message_text(
+            query,
+            "\n".join(text_lines),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def session_show_full(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_owner(user_id):
+            await query.answer("این بخش فقط برای مالک ربات است!", show_alert=True)
+            return
+        
+        await query.answer()
+        saved_session = await self.db.get_scanner_state("user_session_string")
+        if not saved_session or saved_session == "False":
+            await query.answer("سشنی ذخیره نشده.", show_alert=True)
+            return
+        
+        try:
+            await context.bot.send_message(
+                user_id,
+                f"🔒 رشتهٔ کامل سشن (فقط برای خودت نگه دار، به کسی نده):\n\n`{saved_session}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await query.answer("✅ تو پیوی برات فرستادم.")
+        except Exception as e:
+            await query.answer(f"❌ نشد تو پیوی بفرستم: {str(e)[:100]}", show_alert=True)
+    
+    async def session_relogin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """شروع مجدد فرایند لاگین از همون پنل سشن‌ها - از منطق موجود
+        start_session_login استفاده می‌کنه تا کد تکراری نشه."""
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_owner(user_id):
+            await query.answer("این بخش فقط برای مالک ربات است!", show_alert=True)
+            return
+        
+        await query.answer()
+        context.user_data['waiting_for_login_phone'] = True
+        await query.message.reply_text(
+            "🔐 برای ساخت سشن جدید:\n\n"
+            "📱 لطفاً شماره تلفن اکانت را همراه با کد کشور وارد کنید:\n"
+            "مثال: +989123456789"
+        )
     
     # ==================== مدیریت تاپیک ====================
     async def admin_topic_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5730,6 +5874,15 @@ class ScannerBot:
                 return
             if data == "topic_list":
                 await self.topic_list(update, context)
+                return
+            if data == "admin_sessions":
+                await self.admin_sessions_panel(update, context)
+                return
+            if data == "session_relogin":
+                await self.session_relogin(update, context)
+                return
+            if data == "session_show_full":
+                await self.session_show_full(update, context)
                 return
             
             # ====== سفارشات ======
