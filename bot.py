@@ -29,11 +29,7 @@ from aiohttp import web
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
 API_ID = 31809598
 API_HASH = "9df12f1fa837a291683e8c5802d82e72"
-USER_SESSION_STR = "1BJWap1sBu4O9H5rgWZl_9xxvrQU38Mdm5txmHdrqitJyIHI-hbADUBn9xODcOAhxbFNJNnbf8o3CWrXQZz2_SX4YGbTW2G_5njqpvCgu7zM62LaX7r64gi1uAVlCAyZxfMRZAhcPSjjMjSOOOZCLEYMMlx8v1KdXrpWOKqGdr1xLkAVH8JSemGbS2M5ypNHYDv-sznDmB67Q0tgRyTpO2ceLoYyy1fzAmgq10yfM8XgJPOSSAnlDwp3N87OKaBCwFEPAOF91wZc_9EmgJ2ddP5rl0HYNvdwh3ImqyHckFHnP6fVZATqzDid8sqW4v1HNznhJ6LLbAK4CVbUFDc8mxDjyAJaCwFo="
-OWNER_ID = 8879869880
-PORT = 8080
-GROQ_API_KEY = "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"
-GITHUB_API_TOKEN = os.environ.get('GITHUB_API_TOKEN', "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")
+USER_SESSION_STR = "1BJWap1wBu6gZELW8wvdU68y67ZB18WdyZPQ0wpsctQl-v9QlotAbCdKNDOTRFqHiS8chqufFWTM-qLhDk3oHsU8CmUYDFX7svhYaUuWnMG-IUYm8tiOqQ0V1xNXo4-6u0G8syFE5pROrya0ORFYiwQYbgOQ9IY124TUcctIlc1KqhB9jiR01Odgp6iMWnHmHH5LB02Qgd6dcgIsAO7uDXU_W27_4Mj_sDLHr72xJ-y8tdN4r5aDFT3r2ELYAnpnRqpWvUlYt4lVzcP40kT_e9el_DIGAhhCMv0tyQfAHvEEHDSbUmLrHV2c1UwIXP11nWqMHRMMHvbx_omDui7m03vkHL_4KnfQ=")
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 RAILWAY_URL = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
 WEBHOOK_URL = f"https://{RAILWAY_URL}/webhook" if RAILWAY_URL else ""
@@ -1143,6 +1139,29 @@ class ChannelScanner:
                             logger.info(f"✅ Group entity resolved via dialogs cache: {GROUP_ID}")
                         except Exception as e2:
                             logger.error(f"❌ Still could not resolve group entity: {e2} - forwarding will keep failing until the scanner account can see this group (must be a member).")
+                    
+                    # === بررسی صحت CONFIG_TOPIC_ID ===
+                    # لینک‌های t.me/c/<group>/<id> همیشه دقیقاً همون آیدی
+                    # ریشهٔ تاپیک (message_thread_id) نیستن؛ این‌جا یک‌بار
+                    # لیست واقعی تاپیک‌های گروه رو می‌گیریم و چک می‌کنیم که
+                    # CONFIG_TOPIC_ID واقعاً وجود داره یا نه - اگه نه، به‌جای
+                    # سکوت (که باعث می‌شد پیام‌ها بی‌صدا برن تاپیک General)
+                    # یک خطای واضح تو لاگ می‌ندازیم.
+                    if group_entity is not None:
+                        try:
+                            from telethon.tl.functions.channels import GetForumTopicsRequest
+                            topics_result = await bound_client(GetForumTopicsRequest(
+                                channel=group_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                            ))
+                            topic_ids = [t.id for t in topics_result.topics]
+                            if CONFIG_TOPIC_ID in topic_ids:
+                                logger.info(f"✅ CONFIG_TOPIC_ID={CONFIG_TOPIC_ID} تأیید شد - در لیست تاپیک‌های واقعی گروه هست.")
+                            else:
+                                logger.error(f"⛔ CONFIG_TOPIC_ID={CONFIG_TOPIC_ID} در لیست تاپیک‌های واقعی گروه نیست! "
+                                             f"تاپیک‌های موجود: {topic_ids} - برای اصلاح، از پنل «ارسال به تاپیک» دکمهٔ "
+                                             f"«لیست تاپیک‌های گروه» رو بزن و آیدی درست رو بردار.")
+                        except Exception as te:
+                            logger.error(f"⚠️ Could not verify forum topics list: {te}")
                 
                 if self.state.send_to_topic_enabled and group_entity is not None:
                     messages = await self.user_client.get_messages(CHANNEL_1_USERNAME, limit=1)
@@ -2471,6 +2490,7 @@ class ScannerBot:
                 InlineKeyboardButton("روشن", callback_data="topic_on", style="success"),
                 InlineKeyboardButton("خاموش", callback_data="topic_off", style="danger")
             ],
+            [InlineKeyboardButton("📋 لیست تاپیک‌های گروه (پیدا کردن آیدی درست)", callback_data="topic_list", style="primary")],
             [InlineKeyboardButton("بازگشت", callback_data="back_to_admin", style="success")]
         ])
     
@@ -2963,6 +2983,67 @@ class ScannerBot:
         await self.db.set_scanner_state("send_to_topic", "False")
         await query.answer("🔴 ارسال به تاپیک (فوروارد) خاموش شد!")
         await self.admin_topic_panel(update, context)
+    
+    async def topic_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """لیست دقیق و واقعی تاپیک‌های گروه را مستقیم از تلگرام می‌گیرد
+        (نه حدس زدن از روی لینک) - تا آیدی درستِ تاپیک هدف مشخص شود.
+        دلیل نیازمان به این: لینک t.me/c/<group>/<id> همیشه دقیقاً برابر
+        message_thread_id واقعی تاپیک نیست (گاهی به یک پیام داخل تاپیک
+        اشاره می‌کند، نه ریشهٔ خودِ تاپیک)."""
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند!", show_alert=True)
+            return
+        
+        await query.answer("در حال گرفتن لیست تاپیک‌ها...")
+        
+        if self.user_client is None or self.state.session_needs_login:
+            await self.safe_edit_message_text(
+                query,
+                "❌ اول باید از /start اکانت اسکنر را لاگین کنی.",
+                reply_markup=self.topic_buttons()
+            )
+            return
+        
+        try:
+            from telethon.tl.functions.channels import GetForumTopicsRequest
+            group_entity = await self.user_client.get_entity(GROUP_ID)
+            result = await self.user_client(GetForumTopicsRequest(
+                channel=group_entity,
+                offset_date=0,
+                offset_id=0,
+                offset_topic=0,
+                limit=100
+            ))
+            
+            lines = ["📋 **تاپیک‌های واقعی این گروه:**\n"]
+            current_marker = ""
+            for t in result.topics:
+                tid = t.id
+                title = getattr(t, 'title', '?')
+                mark = " ⬅️ **الان همین انتخاب شده**" if tid == CONFIG_TOPIC_ID else ""
+                lines.append(f"`{tid}` — {title}{mark}")
+            
+            lines.append(f"\n\nآیدی فعلیِ تنظیم‌شده تو کد: `{CONFIG_TOPIC_ID}`")
+            lines.append("\nهر کدوم از این آیدی‌های بالا (`tid`) رو که می‌خوای، بهم بگو تا دقیقاً همون رو تو `CONFIG_TOPIC_ID` بذارم.")
+            
+            await self.safe_edit_message_text(
+                query,
+                "\n".join(lines),
+                reply_markup=self.topic_buttons(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.error(f"❌ topic_list error: {e}")
+            await self.safe_edit_message_text(
+                query,
+                f"❌ خطا در گرفتن لیست تاپیک‌ها: {str(e)[:300]}\n\n"
+                f"اگه پیام «AUTH_KEY_DUPLICATED» یا «two different IP» بود، یعنی هنوز دو نمونه از ربات با هم روشنن - "
+                f"اول باید مطمئن بشی فقط یه نمونه از ربات (فقط یه Deployment رو Railway، نه هم لوکال هم Railway) روشنه.",
+                reply_markup=self.topic_buttons()
+            )
     
     # ==================== مدیریت کانفنیگ TXT ====================
     async def admin_txt_scanner(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5642,6 +5723,9 @@ class ScannerBot:
                 return
             if data == "topic_off":
                 await self.topic_off(update, context)
+                return
+            if data == "topic_list":
+                await self.topic_list(update, context)
                 return
             
             # ====== سفارشات ======
