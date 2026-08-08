@@ -9,6 +9,8 @@ import random
 import json
 import logging
 import time
+import ipaddress
+import socket
 import html
 import asyncpg
 from datetime import datetime, timedelta
@@ -32,8 +34,11 @@ API_HASH = "9df12f1fa837a291683e8c5802d82e72"
 USER_SESSION_STR = "1BJWap1wBu16NY_0HcarsQWtZQdZsHvqR22Y9Myy78bTxIADm7h_Xrfn-yzCgp8dwpXhqPrRyoOv3R5RAyqaKBvDbya4f3V-bwFoI0cpYR6SXly2_kbJv3S9VRkoZI5PfPT-wHWBGiRulDXjAqnC8pNYVkJnd7VpCQ_jXRw-NaHhLnLdQ-sdWIU0DlX0mfzk_qZVMlfqSu8831cgdTFmkgBjTsP2YSobS2nN3SrDRvlUXUWknpfkyGjwqPd4s49EuDStDcYPJ60VbjWfb-Fwca_CtAWRx4FCEfH2oXlWkZvxRKCSQCXrWxuoxtlCH2OLONYHkTOkE_sfXbckIjTl5k2e-NdEuZkU="
 OWNER_ID = 8879869880
 PORT = 8080
-GROQ_API_KEY = "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"
-GITHUB_API_TOKEN = os.environ.get('GITHUB_API_TOKEN', "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")
+GROQ_API_KEY = "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"
+GITHUB_API_TOKEN = os.environ.get('GITHUB_API_TOKEN', "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")
+AI_ADMIN_API_KEY = os.environ.get('AI_ADMIN_API_KEY', "sk-air-1aHXL8cLZKvgS6qqeQGsmZNiDPBZPkPECdRcdqLgpBfBlMkA")
+AI_ADMIN_API_URL = "https://api.airforce/v1/chat/completions"
+AI_ADMIN_MODEL = "deepseek-v3"
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 RAILWAY_URL = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
 WEBHOOK_URL = f"https://{RAILWAY_URL}/webhook" if RAILWAY_URL else ""
@@ -1087,6 +1092,57 @@ class AIManager:
             except Exception as e:
                 logger.error(f"AI Error: {e}")
                 return {"type": "text", "text": f"❌ خطا: {str(e)[:100]}"}
+    
+    async def get_admin_ai_response(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, str]:
+        """دستیار AI مخصوص پنل ادمین - از سرویس دیگه (api.airforce/deepseek-v3)
+        با max_tokens خیلی بزرگ‌تر استفاده می‌کنه تا بتونه مثل یه دستیار
+        کدنویسی واقعی، فایل/کد بزرگ و کامل بسازه (نه فقط پاسخ کوتاه)."""
+        try:
+            if not AI_ADMIN_API_KEY:
+                return {"type": "text", "text": "❌ کلید API دستیار ادمین تنظیم نشده!"}
+            
+            system_prompt = """شما یک دستیار برنامه‌نویسی و ادمین حرفه‌ای برای یه ربات تلگرام هستید.
+قوانین:
+1. اگه ازت کد یا فایل کامل خواسته شد، کد رو کامل و بدون خلاصه‌سازی بنویس (نه فقط تکه‌ای از کد).
+2. کدها رو همیشه داخل بلاک کد با زبان مشخص بذار.
+3. برای سوالات فنی/تنظیمات ربات، دقیق و عملی جواب بده.
+4. به فارسی پاسخ بده مگر اینکه کد بخوای بنویسی."""
+            
+            headers = {"Authorization": f"Bearer {AI_ADMIN_API_KEY}", "Content-Type": "application/json"}
+            messages = [{"role": "system", "content": system_prompt}]
+            if history:
+                messages.extend(history[-10:])
+            messages.append({"role": "user", "content": message})
+            
+            data = {
+                "model": AI_ADMIN_MODEL,
+                "messages": messages,
+                "temperature": 0.4,
+                "max_tokens": 8000
+            }
+            
+            timeout = aiohttp.ClientTimeout(total=90)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(AI_ADMIN_API_URL, headers=headers, json=data) as response:
+                    if response.status == 429:
+                        return {"type": "text", "text": "⏳ تعداد درخواست‌ها زیاد شد. کمی صبر کن."}
+                    elif response.status == 401:
+                        return {"type": "text", "text": "❌ کلید API دستیار ادمین نامعتبر/منقضیه."}
+                    elif response.status != 200:
+                        err = await response.text()
+                        return {"type": "text", "text": f"❌ خطای سرور AI ({response.status}): {err[:200]}"}
+                    
+                    result = await response.json()
+                    if "error" in result:
+                        return {"type": "text", "text": f"❌ خطای API: {result['error'].get('message', 'ناشناخته')}"}
+                    
+                    text = result["choices"][0]["message"]["content"]
+                    return {"type": "text", "text": text}
+        except asyncio.TimeoutError:
+            return {"type": "text", "text": "⏱️ زمان پاسخ‌دهی تموم شد. دوباره امتحان کن (شاید درخواست خیلی بزرگ بود)."}
+        except Exception as e:
+            logger.error(f"Admin AI Error: {e}")
+            return {"type": "text", "text": f"❌ خطا: {str(e)[:150]}"}
 
 # ==================== کلاس مدیریت اسکنر ====================
 class ChannelScanner:
@@ -1363,23 +1419,52 @@ class ChannelScanner:
         return None
     
     async def check_config_health(self, host: Optional[str], port: Optional[int], timeout: float = 3.0) -> Tuple[bool, Optional[int]]:
-        """تست سلامت واقعی + اندازه‌گیری پینگ (round-trip زمان برقراری
-        اتصال TCP به‌جای ICMP، چون تو کانتینر معمولاً دسترسی به ping خام
-        نیست - ولی برای این هدف همون‌قدر معتبره).
-        طبق درخواست «ضد خرابی بیشتر»: به‌جای یک تلاش تک، ۲ بار با فاصلهٔ کم
-        امتحان می‌کنیم تا یک قطعی موقتی/گذرا باعث نشه یه کانفنیگ سالم به
-        اشتباه «مرده» تشخیص داده بشه. کافیه یکی از دو تلاش موفق باشه."""
+        """تست سلامت چندلایه (طبق درخواست «چند فیلتر لایه»):
+        لایه ۱) اعتبار فرمت host/port
+        لایه ۲) رد کردن IPهای محلی/خصوصی/بی‌معنی (127.x, 10.x, 192.168.x, ...)
+        لایه ۳) اگه host دامنه است (نه IP خام)، اول resolve میشه - اگه
+                 resolve نشه، اصلاً TCP امتحان نمی‌کنیم (وقت تلف نشه)
+        لایه ۴) تست واقعی اتصال TCP + اندازه‌گیری پینگ، با ۲ تلاش (ضد
+                 خرابی/false-negative گذرا) - کافیه یکی موفق بشه."""
+        # لایه ۱: فرمت
         if not host or not port:
             return False, None
         
-        # آدرس‌های محلی/بی‌معنی هرگز یک سرور واقعی نیستند
+        # لایه ۲: آدرس‌های محلی/خصوصی هرگز یک سرور واقعی نیستند
         if host in ('127.0.0.1', 'localhost', '0.0.0.0', '::1'):
             return False, None
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved or ip_obj.is_multicast:
+                return False, None
+        except ValueError:
+            pass  # host یه دامنه است، نه IP خام - می‌ره لایهٔ بعد
         
+        # لایه ۳: resolve دامنه (اگه IP خام نبود)
+        target_host = host
+        try:
+            ipaddress.ip_address(host)
+            is_raw_ip = True
+        except ValueError:
+            is_raw_ip = False
+        
+        if not is_raw_ip:
+            try:
+                loop = asyncio.get_event_loop()
+                infos = await asyncio.wait_for(
+                    loop.getaddrinfo(host, port, type=socket.SOCK_STREAM),
+                    timeout=timeout
+                )
+                if not infos:
+                    return False, None
+            except Exception:
+                return False, None
+        
+        # لایه ۴: تست واقعی اتصال TCP + پینگ (۲ تلاش، ضد خرابی گذرا)
         for attempt in range(2):
             try:
                 start = time.monotonic()
-                fut = asyncio.open_connection(host, port)
+                fut = asyncio.open_connection(target_host, port)
                 reader, writer = await asyncio.wait_for(fut, timeout=timeout)
                 ping_ms = int((time.monotonic() - start) * 1000)
                 writer.close()
@@ -1487,9 +1572,16 @@ class ChannelScanner:
                 return True
         return False
     
-    async def scan_config_channel(self, channel: str) -> Optional[Tuple[Any, str]]:
+    async def scan_config_channel(self, channel: str) -> List[str]:
+        """اسکن یک چنل و برگرداندن *همهٔ* کانفنیگ‌های معتبر جدید - نه فقط
+        اولی. طبق درخواست شما: بعضی چنل‌ها تو یه پیام چند کانفنیگ با هم
+        می‌ذارن؛ قبلاً به محض پیدا کردن اولین کانفنیگ، تابع فوراً برمی‌گشت
+        و بقیهٔ کانفنیگ‌های همون پیام (و حتی پیام‌های جدیدتر) رد می‌شدن -
+        چون last_msg_id از قبل جلو رفته بود، اون‌ها برای همیشه گم می‌شدن."""
         if await self.wait_if_needed():
-            return None, None
+            return []
+        
+        found_configs: List[str] = []
         
         try:
             if (datetime.now() - self.state.config_last_scan_reset).seconds > 300:
@@ -1521,7 +1613,7 @@ class ChannelScanner:
                     configs = await self.extract_configs_from_text(msg.text)
                     for config in configs:
                         if self.is_valid_config(config) and await self.is_config_for_iran(config):
-                            return msg, config
+                            found_configs.append(config)
                 
                 if msg.file and msg.file.name:
                     file_name = msg.file.name.lower()
@@ -1533,7 +1625,7 @@ class ChannelScanner:
                                 for config in configs:
                                     if self.is_valid_config(config) and await self.is_config_for_iran(config):
                                         logger.info(f"📄 Found config in TXT: {msg.file.name}")
-                                        return msg, config
+                                        found_configs.append(config)
                         except Exception as e:
                             logger.error(f"Error reading TXT: {e}")
                 
@@ -1549,21 +1641,21 @@ class ChannelScanner:
                                             for config in configs:
                                                 if self.is_valid_config(config) and await self.is_config_for_iran(config):
                                                     logger.info(f"📄 Found config in ZIP: {file_name}")
-                                                    return msg, config
+                                                    found_configs.append(config)
                     except Exception as e:
                         logger.error(f"Error reading ZIP: {e}")
                 
                 await asyncio.sleep(0.2)
             
-            return None, None
+            return found_configs
             
         except FloodWaitError as e:
             self.state.flood_wait_until = datetime.now() + timedelta(seconds=e.seconds)
             logger.warning(f"⛔ FLOOD WAIT: {e.seconds}s")
-            return None, None
+            return found_configs
         except Exception as e:
             logger.error(f"Error scanning {channel}: {e}")
-            return None, None
+            return found_configs
     
     async def scan_proxy_channel(self, channel: str) -> Optional[Tuple[Any, str]]:
         if await self.wait_if_needed():
@@ -1917,8 +2009,9 @@ class ChannelScanner:
         
         # طبق درخواست: جدیدترین کانفنیگ‌ها زودتر گرفته/ارسال شوند - معمولاً
         # جدیدترین موارد در انتهای فایل ساب/گیت‌هاب اضافه می‌شوند، پس لیست
-        # را برعکس می‌کنیم تا صف با جدیدترین‌ها شروع شود.
-        configs = list(reversed(configs))
+        # را برعکس می‌کنیم تا صف با جدیدترین‌ها شروع شود. طبق درخواست فقط
+        # ۱۰۰ تای آخر/جدیدترین از این لینک پردازش بشه.
+        configs = list(reversed(configs))[:100]
         
         result = await self.db.add_github_configs_to_queue(configs, source_url=url)
         result['ok'] = True
@@ -2017,8 +2110,10 @@ class ChannelScanner:
             logger.error(f"❌ GitHub topic scan error: {e}")
             return {'ok': False, 'error': str(e), 'found': 0, 'repos_scanned': repos_scanned}
         
-        # جدیدترین‌ها اول
-        all_configs = list(reversed(all_configs))
+        # جدیدترین‌ها اول - و طبق درخواست فقط ۲۰۰ کانفنیگ آخر/جدیدترین
+        # این تاپیک پردازش بشه (نه هر چقدر که پیدا شد، تا هم صف شلوغ نشه
+        # هم فقط جدیدترین‌ها بری بفرستن)
+        all_configs = list(reversed(all_configs))[:200]
         result = await self.db.add_github_configs_to_queue(all_configs, source_url=f"github-topic:{topic}")
         result['ok'] = True
         result['repos_scanned'] = repos_scanned
@@ -2216,17 +2311,22 @@ class ChannelScanner:
                         
                         logger.info(f"🔍 Scanning config: {channel}")
                         try:
-                            msg, config_text = await self.scan_config_channel(channel)
+                            configs_found = await self.scan_config_channel(channel)
                         except Exception as ce:
                             logger.error(f"⚠️ Error scanning {channel}: {ce}")
-                            msg, config_text = None, None
+                            configs_found = []
                         
-                        if config_text:
+                        # طبق درخواست: بعضی پیام‌ها چند کانفنیگ با هم دارن -
+                        # همه‌شون رو (نه فقط اولی) تست پینگ می‌کنیم و اونایی
+                        # که سالمن رو می‌فرستیم.
+                        if configs_found:
+                            logger.info(f"✅ {len(configs_found)} config(s) found from {channel}")
+                        for config_text in configs_found:
                             config_hash = str(abs(hash(config_text.split('#')[0])))
                             if not await self.db.is_config_sent(config_hash):
                                 self.state.add_config_hash(config_hash)
-                                logger.info(f"✅ New config from {channel}")
                                 await self.send_config(config_text, channel)
+                                await asyncio.sleep(0.5)
                         
                         await asyncio.sleep(per_channel_gap)
                 else:
@@ -2569,6 +2669,12 @@ class ScannerBot:
             return InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("GitHub", callback_data="admin_github", style="danger")
+                ],
+                [
+                    InlineKeyboardButton("🤖 دستیار AI (ادمین)", callback_data="admin_ai", style="primary")
+                ],
+                [
+                    InlineKeyboardButton("💰 ویرایش قیمت‌ها", callback_data="admin_prices", style="primary")
                 ],
                 [
                     InlineKeyboardButton("🩺 وضعیت سلامت سیستم", callback_data="admin_health", style="success")
@@ -3055,6 +3161,138 @@ class ScannerBot:
     
     # ==================== سشن‌ها (فقط مالک) ====================
     # ==================== وضعیت سلامت سیستم (جدید) ====================
+    # ==================== دستیار AI ادمین (جدید) ====================
+    async def admin_ai_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        context.user_data['waiting_for_admin_ai'] = True
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_page_2", style="success")]
+        ])
+        await self.safe_edit_message_text(
+            query,
+            "🤖 **دستیار AI ادمین**\n\n"
+            "سوالت رو بپرس یا بگو چه کد/فایلی بسازم. اگه جواب طولانی بشه (مثل یه فایل کد کامل)، "
+            "خودکار به‌صورت فایل برات می‌فرستم، نه پیام بریده‌بریده.\n\n"
+            "برای تغییر قیمت‌ها از دکمهٔ «💰 ویرایش قیمت‌ها» تو صفحهٔ قبل استفاده کن - "
+            "اونجا مستقیم و مطمئنه (این دستیار فقط جواب/کد می‌ده، مستقیم تنظیمات رو عوض نمی‌کنه).\n\n"
+            "پیامت رو همینجا بفرست:",
+            reply_markup=keyboard
+        )
+    
+    async def receive_admin_ai_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        text = (message.text or "").strip()
+        
+        if not text:
+            return
+        
+        wait_msg = await message.reply_text("🤖 در حال فکر کردن...")
+        
+        result = await self.ai.get_admin_ai_response(text)
+        response_text = result.get("text", "")
+        
+        # طبق درخواست: اگه پاسخ بزرگه (مثلاً یه فایل کد کامل)، به‌جای بریدن
+        # پیام یا رد کردن، خودش رو تبدیل به فایل می‌کنه و می‌فرسته.
+        if len(response_text) > 3500:
+            file_path = f"/tmp/ai_response_{message.message_id}.txt"
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(response_text)
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+            await message.reply_document(
+                document=open(file_path, "rb"),
+                filename="ai_response.txt",
+                caption="🤖 پاسخ طولانی بود، به‌صورت فایل فرستادم."
+            )
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+        else:
+            await wait_msg.edit_text(response_text)
+    
+    # ==================== ویرایش قیمت‌ها (جدید) ====================
+    def price_edit_buttons(self):
+        buttons = []
+        row = []
+        for key, name in PRICE_NAMES.items():
+            row.append(InlineKeyboardButton(f"{name} — {PRICES.get(key, 0):,} تومان", callback_data=f"priceedit_{key}", style="primary"))
+            if len(row) == 1:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_page_2", style="success")])
+        return InlineKeyboardMarkup(buttons)
+    
+    async def admin_prices_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        await self.safe_edit_message_text(
+            query,
+            "💰 **ویرایش قیمت‌ها**\n\nروی هر پلن بزن تا قیمت جدیدش رو وارد کنی:",
+            reply_markup=self.price_edit_buttons(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def price_edit_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        
+        plan_key = query.data.replace("priceedit_", "")
+        if plan_key not in PRICES:
+            await query.answer("پلن نامعتبر.", show_alert=True)
+            return
+        
+        await query.answer()
+        context.user_data['waiting_for_price_edit'] = plan_key
+        await query.message.reply_text(
+            f"💰 قیمت فعلی «{PRICE_NAMES.get(plan_key, plan_key)}»: {PRICES.get(plan_key, 0):,} تومان\n\n"
+            f"قیمت جدید رو فقط به عدد (تومان) بفرست:"
+        )
+    
+    async def receive_price_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        text = (message.text or "").strip().replace(",", "").replace("،", "")
+        plan_key = context.user_data.get('waiting_for_price_edit')
+        context.user_data['waiting_for_price_edit'] = None
+        
+        if not plan_key or plan_key not in PRICES:
+            await message.reply_text("❌ چیزی برای ویرایش انتخاب نشده بود. دوباره از پنل قیمت‌ها شروع کن.")
+            return
+        
+        if not text.isdigit():
+            await message.reply_text("❌ فقط عدد بفرست.")
+            return
+        
+        new_price = int(text)
+        old_price = PRICES.get(plan_key, 0)
+        # چون PRICES یه دیکشنری global هست، همینجا آپدیتش می‌کنیم و همه‌جای
+        # ربات (دکمه‌های خرید و...) خودکار قیمت جدید رو می‌بینن.
+        PRICES[plan_key] = new_price
+        await self.db.set_scanner_state("prices_json", json.dumps(PRICES))
+        
+        await message.reply_text(
+            f"✅ قیمت «{PRICE_NAMES.get(plan_key, plan_key)}» عوض شد:\n"
+            f"{old_price:,} ← {new_price:,} تومان",
+            reply_markup=self.price_edit_buttons()
+        )
+    
     async def admin_health_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """یه داشبورد یک‌جا که همون چیزایی که تو این چند روز مدام از رو لاگ
         دستی چک می‌کردیم (سشن، وضعیت اسکنرها، تاپیک، تعداد چنل‌ها، توکن
@@ -6015,6 +6253,15 @@ class ScannerBot:
             await self.receive_config_channel_remove(update, context)
             return
         
+        if context.user_data.get('waiting_for_admin_ai') and message.text:
+            context.user_data['waiting_for_admin_ai'] = False
+            await self.receive_admin_ai_message(update, context)
+            return
+        
+        if context.user_data.get('waiting_for_price_edit') and message.text:
+            await self.receive_price_edit(update, context)
+            return
+        
         # دریافت فایل TXT
         if context.user_data.get('waiting_for_txt') and message.document:
             await self.scanner.handle_txt_file(update, context)
@@ -6304,6 +6551,15 @@ class ScannerBot:
                 return
             if data == "db_cleanup_confirm":
                 await self.db_cleanup_confirm(update, context)
+                return
+            if data == "admin_ai":
+                await self.admin_ai_panel(update, context)
+                return
+            if data == "admin_prices":
+                await self.admin_prices_panel(update, context)
+                return
+            if data.startswith("priceedit_"):
+                await self.price_edit_select(update, context)
                 return
             if data == "session_relogin":
                 await self.session_relogin(update, context)
@@ -6620,6 +6876,17 @@ class ScannerBot:
                     pass
             else:
                 await self.db.set_scanner_state("config_scan_channels", json.dumps(self.state.config_scan_channels))
+            
+            # طبق درخواست: قیمت‌ها هم از دیتابیس بارگذاری بشن (اگه قبلاً از
+            # پنل «ویرایش قیمت‌ها» تغییر داده شده باشن)
+            prices_raw = await self.db.get_scanner_state("prices_json")
+            if prices_raw and prices_raw != "False":
+                try:
+                    loaded_prices = json.loads(prices_raw)
+                    if isinstance(loaded_prices, dict):
+                        PRICES.update(loaded_prices)
+                except Exception:
+                    pass
             
             logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running}, Proxy: {self.state.proxy_scanner_running}, TXT: {self.state.txt_scanner_running}, GitHub: {self.state.github_scanner_running}")
         except Exception as e:
