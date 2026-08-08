@@ -29,7 +29,11 @@ from aiohttp import web
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
 API_ID = 31809598
 API_HASH = "9df12f1fa837a291683e8c5802d82e72"
-USER_SESSION_STR = "1BJWap1wBu6gZELW8wvdU68y67ZB18WdyZPQ0wpsctQl-v9QlotAbCdKNDOTRFqHiS8chqufFWTM-qLhDk3oHsU8CmUYDFX7svhYaUuWnMG-IUYm8tiOqQ0V1xNXo4-6u0G8syFE5pROrya0ORFYiwQYbgOQ9IY124TUcctIlc1KqhB9jiR01Odgp6iMWnHmHH5LB02Qgd6dcgIsAO7uDXU_W27_4Mj_sDLHr72xJ-y8tdN4r5aDFT3r2ELYAnpnRqpWvUlYt4lVzcP40kT_e9el_DIGAhhCMv0tyQfAHvEEHDSbUmLrHV2c1UwIXP11nWqMHRMMHvbx_omDui7m03vkHL_4KnfQ=")
+USER_SESSION_STR = ""  # طبق درخواست: سشنِ قدیمیِ غیرفعال حذف شد - سشن واقعی همیشه از دیتابیس (ست‌شده توسط لاگین از داخل خود ربات) خونده می‌شه
+OWNER_ID = 8879869880
+PORT = 8080
+GROQ_API_KEY = "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"
+GITHUB_API_TOKEN = os.environ.get('GITHUB_API_TOKEN', "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")
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 RAILWAY_URL = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
 WEBHOOK_URL = f"https://{RAILWAY_URL}/webhook" if RAILWAY_URL else ""
@@ -2465,6 +2469,9 @@ class ScannerBot:
                     InlineKeyboardButton("GitHub", callback_data="admin_github", style="danger")
                 ],
                 [
+                    InlineKeyboardButton("🔑 سشن‌ها (فقط مالک)", callback_data="admin_sessions", style="danger")
+                ],
+                [
                     InlineKeyboardButton("⬅️ صفحه قبل", callback_data="admin_panel_page_1", style="primary"),
                     InlineKeyboardButton("بازگشت", callback_data="back_main", style="danger")
                 ]
@@ -2937,6 +2944,97 @@ class ScannerBot:
                     [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="danger")]
                 ])
             )
+    
+    # ==================== سشن‌ها (فقط مالک) ====================
+    async def admin_sessions_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """طبق درخواست: فقط مالک اصلی (نه ادمین‌های دیگه) می‌تونه سشن فعلی
+        اکانت اسکنر رو ببینه و/یا دوباره لاگین کنه تا سشن جدید ساخته و
+        خودکار ذخیره بشه. سشن قدیمیِ هاردکد‌شده تو کد حذف شده - از این به
+        بعد تنها منبع سشن، همین لاگینِ داخل ربات و دیتابیسه."""
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_owner(user_id):
+            await query.answer("این بخش فقط برای مالک ربات است!", show_alert=True)
+            return
+        
+        await query.answer()
+        
+        saved_session = await self.db.get_scanner_state("user_session_string")
+        has_session = bool(saved_session and saved_session != "False")
+        
+        text_lines = ["🔑 **مدیریت سشن اکانت اسکنر**\n"]
+        
+        if self.state.session_needs_login or self.user_client is None or not has_session:
+            text_lines.append("🔴 وضعیت: سشن فعال/معتبری وجود ندارد.")
+            text_lines.append("برای ساخت سشن جدید، روی «ورود / ساخت سشن جدید» بزن، شماره و کدی که تلگرام می‌فرسته رو وارد کن - سشن خودکار ساخته و ذخیره می‌شه.")
+        else:
+            try:
+                me = await self.user_client.get_me()
+                text_lines.append("🟢 وضعیت: متصل و فعال")
+                text_lines.append(f"👤 اکانت: @{me.username if me and me.username else 'بدون‌یوزرنیم'} ({me.id if me else '?'})")
+            except Exception:
+                text_lines.append("🟡 وضعیت: سشن ذخیره شده ولی الان قابل تایید نیست (احتمالاً قطع/در حال ری‌کانکت)")
+            
+            masked = saved_session[:10] + "..." + saved_session[-10:] if len(saved_session) > 24 else "***"
+            text_lines.append(f"\n🔒 سشن (خلاصه‌شده): `{masked}`")
+            text_lines.append("برای دیدن رشتهٔ کامل سشن (برای بکاپ)، روی دکمهٔ زیر بزن.")
+        
+        keyboard = [
+            [InlineKeyboardButton("🔐 ورود / ساخت سشن جدید", callback_data="session_relogin", style="success")]
+        ]
+        if has_session:
+            keyboard.append([InlineKeyboardButton("👁️ نمایش کامل سشن", callback_data="session_show_full", style="danger")])
+        keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_page_2", style="primary")])
+        
+        await self.safe_edit_message_text(
+            query,
+            "\n".join(text_lines),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def session_show_full(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_owner(user_id):
+            await query.answer("این بخش فقط برای مالک ربات است!", show_alert=True)
+            return
+        
+        await query.answer()
+        saved_session = await self.db.get_scanner_state("user_session_string")
+        if not saved_session or saved_session == "False":
+            await query.answer("سشنی ذخیره نشده.", show_alert=True)
+            return
+        
+        try:
+            await context.bot.send_message(
+                user_id,
+                f"🔒 رشتهٔ کامل سشن (فقط برای خودت نگه دار، به کسی نده):\n\n`{saved_session}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await query.answer("✅ تو پیوی برات فرستادم.")
+        except Exception as e:
+            await query.answer(f"❌ نشد تو پیوی بفرستم: {str(e)[:100]}", show_alert=True)
+    
+    async def session_relogin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """شروع مجدد فرایند لاگین از همون پنل سشن‌ها - از منطق موجود
+        start_session_login استفاده می‌کنه تا کد تکراری نشه."""
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_owner(user_id):
+            await query.answer("این بخش فقط برای مالک ربات است!", show_alert=True)
+            return
+        
+        await query.answer()
+        context.user_data['waiting_for_login_phone'] = True
+        await query.message.reply_text(
+            "🔐 برای ساخت سشن جدید:\n\n"
+            "📱 لطفاً شماره تلفن اکانت را همراه با کد کشور وارد کنید:\n"
+            "مثال: +989123456789"
+        )
     
     # ==================== مدیریت تاپیک ====================
     async def admin_topic_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5726,6 +5824,15 @@ class ScannerBot:
                 return
             if data == "topic_list":
                 await self.topic_list(update, context)
+                return
+            if data == "admin_sessions":
+                await self.admin_sessions_panel(update, context)
+                return
+            if data == "session_relogin":
+                await self.session_relogin(update, context)
+                return
+            if data == "session_show_full":
+                await self.session_show_full(update, context)
                 return
             
             # ====== سفارشات ======
