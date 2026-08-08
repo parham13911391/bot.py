@@ -854,8 +854,10 @@ CONFIG_TOPIC_ID = 108538
 PROXY_TOPIC_ID = 108613
 
 # ==================== لیست چنل‌های منبع ====================
-SOURCE_CONFIG_CHANNELS = [
-    "@FarazV2ray",
+SOURCE_CONFIG_CHANNELS_DEFAULT = [
+    "@Natrixo",
+    "@Farah_VPN",
+    "@NamazVPN",
     "@ConfigsHUB"
 ]
 
@@ -920,6 +922,11 @@ class BotState:
     proxy_log_enabled: bool = False
     send_to_topic_enabled: bool = False
     
+    # طبق درخواست: لیست چنل‌های اسکنر کانفنیگ دیگه هاردکد نیست - از
+    # دیتابیس خونده/ذخیره می‌شه تا از تو خودِ ربات (افزودن/حذف چنل) قابل
+    # مدیریت باشه، بدون نیاز به ادیت کد یا ری‌دیپلوی.
+    config_scan_channels: List[str] = field(default_factory=lambda: list(SOURCE_CONFIG_CHANNELS_DEFAULT))
+    
     sent_config_hashes: Set[str] = field(default_factory=set)
     sent_proxy_hashes: Set[str] = field(default_factory=set)
     
@@ -953,6 +960,11 @@ class BotState:
     flood_wait_until: Optional[datetime] = None
     scan_counter: int = 0
     last_scan_reset: datetime = field(default_factory=datetime.now)
+    # طبق درخواست چک هر ۱۰ (یا حتی ۵) ثانیه برای اسکنر کانفنیگ، یه شمارندهٔ
+    # جدا از پروکسی می‌خوایم؛ شمارندهٔ مشترک قدیمی با این تعداد چنل و این
+    # تناوب خیلی زود پر می‌شد و باعث توقف اجباری تا ۵ دقیقه‌ای می‌شد.
+    config_scan_counter: int = 0
+    config_last_scan_reset: datetime = field(default_factory=datetime.now)
     current_batch_index: int = 0
     config_last_msg_id: Dict[str, int] = field(default_factory=dict)
     proxy_last_msg_id: Dict[str, int] = field(default_factory=dict)
@@ -984,7 +996,7 @@ class BotState:
         return user_id in self.banned_users
     
     def get_next_batch(self) -> List[str]:
-        return SOURCE_CONFIG_CHANNELS
+        return self.config_scan_channels
 
 # ==================== کلاس مدیریت هوش مصنوعی ====================
 class AIManager:
@@ -1462,18 +1474,22 @@ class ChannelScanner:
             return None, None
         
         try:
-            if (datetime.now() - self.state.last_scan_reset).seconds > 300:
-                self.state.scan_counter = 0
-                self.state.last_scan_reset = datetime.now()
+            if (datetime.now() - self.state.config_last_scan_reset).seconds > 300:
+                self.state.config_scan_counter = 0
+                self.state.config_last_scan_reset = datetime.now()
             
-            if self.state.scan_counter >= 10:
-                wait_time = 300 - (datetime.now() - self.state.last_scan_reset).seconds
+            # طبق تجربه، یک اکانت واقعی تلگرام برای get_messages ساده روی
+            # چند تا چنل ثابت به‌راحتی صدها درخواست در ۵ دقیقه رو تحمل
+            # می‌کنه؛ عدد قبلی (۱۰) برای این تعداد چنل/تناوب خیلی محافظه‌کارانه
+            # بود و باعث توقف‌های اجباری می‌شد.
+            if self.state.config_scan_counter >= 120:
+                wait_time = 300 - (datetime.now() - self.state.config_last_scan_reset).seconds
                 if wait_time > 0:
                     await asyncio.sleep(wait_time)
-                self.state.scan_counter = 0
-                self.state.last_scan_reset = datetime.now()
+                self.state.config_scan_counter = 0
+                self.state.config_last_scan_reset = datetime.now()
             
-            self.state.scan_counter += 1
+            self.state.config_scan_counter += 1
             last_id = self.state.config_last_msg_id.get(channel, 0)
             
             async for msg in self.user_client.iter_messages(channel, min_id=last_id, limit=20, wait_time=0.5):
@@ -2146,7 +2162,10 @@ class ChannelScanner:
     
     async def config_scan_loop(self):
         """اسکن مداوم چنل‌های منبع کانفنیگ - کاملاً مستقل از اسکنر پروکسی،
-        تا اسکن پروکسی (که کند است) سرعت ارسال کانفنیگ را پایین نیاورد."""
+        تا اسکن پروکسی (که کند است) سرعت ارسال کانفنیگ را پایین نیاورد.
+        طبق درخواست: هر چنل تقریباً هر ۱۰ ثانیه چک می‌شود (لیست چنل‌ها از
+        self.state.config_scan_channels خونده می‌شه - قابل‌مدیریت از پنل
+        ربات، بدون نیاز به ادیت کد)."""
         logger.info("🔍 Config scan loop started")
         while True:
             try:
@@ -2154,29 +2173,29 @@ class ChannelScanner:
                     await asyncio.sleep(10)
                     continue
                 
-                if self.state.config_scanner_running:
-                    for channel in SOURCE_CONFIG_CHANNELS:
+                if self.state.config_scanner_running and self.state.config_scan_channels:
+                    channels = list(self.state.config_scan_channels)
+                    per_channel_gap = max(10 / max(len(channels), 1), 1.5)
+                    
+                    for channel in channels:
                         if not self.state.config_scanner_running:
                             break
                         
                         logger.info(f"🔍 Scanning config: {channel}")
-                        msg, config_text = await self.scan_config_channel(channel)
+                        try:
+                            msg, config_text = await self.scan_config_channel(channel)
+                        except Exception as ce:
+                            logger.error(f"⚠️ Error scanning {channel}: {ce}")
+                            msg, config_text = None, None
                         
                         if config_text:
                             config_hash = str(abs(hash(config_text.split('#')[0])))
                             if not await self.db.is_config_sent(config_hash):
                                 self.state.add_config_hash(config_hash)
                                 logger.info(f"✅ New config from {channel}")
-                                success = await self.send_config(config_text, channel)
-                                
-                                if success:
-                                    await asyncio.sleep(3)
-                                else:
-                                    await asyncio.sleep(1)
+                                await self.send_config(config_text, channel)
                         
-                        await asyncio.sleep(3)
-                    
-                    await asyncio.sleep(1)
+                        await asyncio.sleep(per_channel_gap)
                 else:
                     await asyncio.sleep(1)
             except Exception as e:
@@ -4985,20 +5004,110 @@ class ScannerBot:
                 InlineKeyboardButton("⏹ توقف", callback_data="config_stop", style="danger")
             ],
             [
+                InlineKeyboardButton("➕ افزودن چنل", callback_data="config_channel_add", style="primary")
+            ],
+            [
+                InlineKeyboardButton("➖ حذف چنل", callback_data="config_channel_remove", style="primary")
+            ],
+            [
                 InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_admin", style="success")
             ]
         ])
         
         sent_count = await self.db.get_sent_configs_count()
+        channels_list = "\n".join(f"{i+1}. {ch}" for i, ch in enumerate(self.state.config_scan_channels)) or "(هیچ چنلی تنظیم نشده)"
         
         await query.edit_message_text(
             f"🎯 **اسکنر کانفنیگ**\n\n"
             f"وضعیت: {status}\n"
-            f"چنل‌ها: {len(SOURCE_CONFIG_CHANNELS)}\n"
+            f"چنل‌ها ({len(self.state.config_scan_channels)}):\n{channels_list}\n\n"
             f"کانفنیگ ارسال شده: {sent_count}",
             reply_markup=keyboard,
             parse_mode=ParseMode.MARKDOWN
         )
+    
+    async def config_channel_add_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        context.user_data['waiting_for_config_channel_add'] = True
+        await query.message.reply_text(
+            "➕ لینک یا یوزرنیم چنل رو بفرست (مثلاً https://t.me/Something یا @Something):"
+        )
+    
+    async def receive_config_channel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        text = (message.text or "").strip()
+        context.user_data['waiting_for_config_channel_add'] = False
+        
+        username = None
+        m = re.search(r't\.me/([A-Za-z0-9_]+)', text)
+        if m:
+            username = m.group(1)
+        elif text.startswith('@'):
+            username = text[1:]
+        elif re.match(r'^[A-Za-z0-9_]+$', text):
+            username = text
+        
+        if not username:
+            await message.reply_text("❌ لینک/یوزرنیم معتبر نبود. دوباره امتحان کن.")
+            return
+        
+        normalized = f"@{username}"
+        if normalized.lower() in [c.lower() for c in self.state.config_scan_channels]:
+            await message.reply_text(f"⚠️ چنل {normalized} از قبل تو لیست هست.")
+            return
+        
+        self.state.config_scan_channels.append(normalized)
+        await self.db.set_scanner_state("config_scan_channels", json.dumps(self.state.config_scan_channels))
+        
+        await message.reply_text(
+            f"✅ چنل {normalized} اضافه شد.\n\n"
+            f"لیست فعلی:\n" + "\n".join(f"{i+1}. {ch}" for i, ch in enumerate(self.state.config_scan_channels))
+        )
+    
+    async def config_channel_remove_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        
+        if not self.state.config_scan_channels:
+            await query.message.reply_text("❌ لیست چنل‌ها خالیه.")
+            return
+        
+        context.user_data['waiting_for_config_channel_remove'] = True
+        channels_list = "\n".join(f"{i+1}. {ch}" for i, ch in enumerate(self.state.config_scan_channels))
+        await query.message.reply_text(
+            f"➖ عدد چنلی که می‌خوای حذف بشه رو بفرست:\n\n{channels_list}"
+        )
+    
+    async def receive_config_channel_remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        text = (message.text or "").strip()
+        context.user_data['waiting_for_config_channel_remove'] = False
+        
+        if not text.isdigit():
+            await message.reply_text("❌ فقط عدد بفرست.")
+            return
+        
+        idx = int(text) - 1
+        if idx < 0 or idx >= len(self.state.config_scan_channels):
+            await message.reply_text("❌ عدد نامعتبره.")
+            return
+        
+        removed = self.state.config_scan_channels.pop(idx)
+        await self.db.set_scanner_state("config_scan_channels", json.dumps(self.state.config_scan_channels))
+        # جلوگیری از سردرگمی: last_msg_id مربوط به چنل حذف‌شده رو هم پاک می‌کنیم
+        self.state.config_last_msg_id.pop(removed, None)
+        
+        remaining = "\n".join(f"{i+1}. {ch}" for i, ch in enumerate(self.state.config_scan_channels)) or "(خالی)"
+        await message.reply_text(f"✅ چنل {removed} حذف شد و دیگه اسکن نمی‌شه.\n\nلیست فعلی:\n{remaining}")
     
     async def proxy_scanner_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -5740,6 +5849,14 @@ class ScannerBot:
             await self.receive_session_import(update, context)
             return
         
+        if context.user_data.get('waiting_for_config_channel_add') and message.text:
+            await self.receive_config_channel_add(update, context)
+            return
+        
+        if context.user_data.get('waiting_for_config_channel_remove') and message.text:
+            await self.receive_config_channel_remove(update, context)
+            return
+        
         # دریافت فایل TXT
         if context.user_data.get('waiting_for_txt') and message.document:
             await self.scanner.handle_txt_file(update, context)
@@ -6149,6 +6266,12 @@ class ScannerBot:
             if data == "admin_config_scanner":
                 await self.config_scanner_panel(update, context)
                 return
+            if data == "config_channel_add":
+                await self.config_channel_add_prompt(update, context)
+                return
+            if data == "config_channel_remove":
+                await self.config_channel_remove_prompt(update, context)
+                return
             if data == "admin_proxy_scanner":
                 await self.proxy_scanner_panel(update, context)
                 return
@@ -6283,7 +6406,7 @@ class ScannerBot:
     async def run(self):
         logger.info("🚀 Starting Bot (Webhook Mode - Port 8080)...")
         logger.info(f"👤 Owner ID: {OWNER_ID}")
-        logger.info(f"📡 Config channels: {len(SOURCE_CONFIG_CHANNELS)}")
+        logger.info(f"📡 Config channels: {len(self.state.config_scan_channels)}")
         logger.info(f"🔄 Proxy channels: {len(SOURCE_PROXY_CHANNELS)}")
         logger.info(f"🧠 AI: {'✅ Enabled' if GROQ_API_KEY else '❌ Disabled'}")
         
@@ -6317,6 +6440,19 @@ class ScannerBot:
             topic_state = await self.db.get_scanner_state("send_to_topic")
             # پیش‌فرض خاموش است مگر اینکه قبلاً صراحتاً روشن شده باشد
             self.state.send_to_topic_enabled = topic_state == "True"
+            
+            # طبق درخواست: لیست چنل‌های اسکنر کانفنیگ از دیتابیس - اگه قبلاً
+            # چیزی ذخیره نشده، همون ۴ چنل پیش‌فرض رو اولین‌بار می‌سازه.
+            channels_raw = await self.db.get_scanner_state("config_scan_channels")
+            if channels_raw and channels_raw != "False":
+                try:
+                    loaded = json.loads(channels_raw)
+                    if isinstance(loaded, list) and loaded:
+                        self.state.config_scan_channels = loaded
+                except Exception:
+                    pass
+            else:
+                await self.db.set_scanner_state("config_scan_channels", json.dumps(self.state.config_scan_channels))
             
             logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running}, Proxy: {self.state.proxy_scanner_running}, TXT: {self.state.txt_scanner_running}, GitHub: {self.state.github_scanner_running}")
         except Exception as e:
