@@ -27,9 +27,9 @@ from aiohttp import web
 
 # ==================== تنظیمات اصلی (جدید) ====================
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
-API_ID = 32233583
-API_HASH = "ce6caac5e6e987ff33fc613d076570a4"
-USER_SESSION_STR = ""  # طبق درخواست: سشنِ قدیمیِ غیرفعال حذف شد - سشن واقعی همیشه از دیتابیس (ست‌شده توسط لاگین از داخل خود ربات) خونده می‌شه
+API_ID = 31809598
+API_HASH = "9df12f1fa837a291683e8c5802d82e72"
+USER_SESSION_STR = "1BJWap1wBu16NY_0HcarsQWtZQdZsHvqR22Y9Myy78bTxIADm7h_Xrfn-yzCgp8dwpXhqPrRyoOv3R5RAyqaKBvDbya4f3V-bwFoI0cpYR6SXly2_kbJv3S9VRkoZI5PfPT-wHWBGiRulDXjAqnC8pNYVkJnd7VpCQ_jXRw-NaHhLnLdQ-sdWIU0DlX0mfzk_qZVMlfqSu8831cgdTFmkgBjTsP2YSobS2nN3SrDRvlUXUWknpfkyGjwqPd4s49EuDStDcYPJ60VbjWfb-Fwca_CtAWRx4FCEfH2oXlWkZvxRKCSQCXrWxuoxtlCH2OLONYHkTOkE_sfXbckIjTl5k2e-NdEuZkU="
 OWNER_ID = 8879869880
 PORT = 8080
 GROQ_API_KEY = "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"
@@ -3031,7 +3031,8 @@ class ScannerBot:
             text_lines.append("برای دیدن رشتهٔ کامل سشن (برای بکاپ)، روی دکمهٔ زیر بزن.")
         
         keyboard = [
-            [InlineKeyboardButton("🔐 ورود / ساخت سشن جدید", callback_data="session_relogin", style="success")]
+            [InlineKeyboardButton("🔐 ورود / ساخت سشن جدید", callback_data="session_relogin", style="success")],
+            [InlineKeyboardButton("📥 وارد کردن سشن دستی (پیست کردن)", callback_data="session_import", style="primary")]
         ]
         if has_session:
             keyboard.append([InlineKeyboardButton("👁️ نمایش کامل سشن", callback_data="session_show_full", style="danger")])
@@ -3085,6 +3086,77 @@ class ScannerBot:
             "📱 لطفاً شماره تلفن اکانت را همراه با کد کشور وارد کنید:\n"
             "مثال: +989123456789"
         )
+    
+    async def session_import(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """طبق درخواست: به‌جای اینکه یه سشن جدید رو داخل خودِ کد هاردکد کنیم
+        (که یعنی هر بار عوض شدن سشن باید فایل رو ادیت/ری‌دیپلوی کنی، و
+        سشن به‌صورت متن خام تو فایل کد می‌مونه)، یه راه امن‌تر: مستقیم از
+        همینجا رشتهٔ سشن رو پیست می‌کنی، ربات خودش تستش می‌کنه و اگه معتبر
+        بود تو دیتابیس ذخیره‌ش می‌کنه - دقیقاً همون مسیر امنی که برای
+        لاگین با شماره/کد ساختیم، فقط برای وقتی که از قبل یه رشتهٔ سشن
+        آماده داری."""
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        if not self.state.is_owner(user_id):
+            await query.answer("این بخش فقط برای مالک ربات است!", show_alert=True)
+            return
+        
+        await query.answer()
+        context.user_data['waiting_for_session_import'] = True
+        await query.message.reply_text(
+            "📥 رشتهٔ کامل سشن رو همینجا پیست کن (فقط خودِ رشته، بدون هیچ متن اضافه):\n\n"
+            "⚠️ توجه: بعد از تایید، همین‌جا (یا هر جای دیگه‌ای که پیستش کردی) بهتره پیامت رو پاک کنی، "
+            "چون این رشته معادل دسترسی کامل به اکانته."
+        )
+    
+    async def receive_session_import(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        session_str = (message.text or "").strip()
+        context.user_data['waiting_for_session_import'] = False
+        
+        if not session_str or len(session_str) < 20:
+            await message.reply_text("❌ این یه رشتهٔ سشن معتبر به‌نظر نمی‌رسه. دوباره از پنل «سشن‌ها» شروع کن.")
+            return
+        
+        wait_msg = await message.reply_text("🔄 در حال تست سشن...")
+        
+        test_client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        try:
+            await test_client.connect()
+            if not await test_client.is_user_authorized():
+                await wait_msg.edit_text("❌ این سشن معتبر/فعال نیست (شاید منقضی یا باطل‌شده).")
+                await test_client.disconnect()
+                return
+            
+            me = await test_client.get_me()
+            
+            # موفق بود - جایگزین کلاینت اصلی می‌شه و تو دیتابیس ذخیره می‌شه
+            new_session_str = test_client.session.save()
+            await self.db.set_scanner_state("user_session_string", new_session_str)
+            
+            old_client = self.user_client
+            self.user_client = test_client
+            if old_client is not None and old_client is not self.user_client:
+                try:
+                    await old_client.disconnect()
+                except Exception:
+                    pass
+            
+            self.state.session_needs_login = False
+            
+            await wait_msg.edit_text(
+                f"✅ سشن با موفقیت وارد و ذخیره شد!\n\n"
+                f"👤 اکانت: @{me.username if me and me.username else 'بدون‌یوزرنیم'} ({me.id})\n\n"
+                f"💡 برای امنیت، پیامی که رشتهٔ سشن توش بود رو الان از این چت پاک کن."
+            )
+        except Exception as e:
+            logger.error(f"❌ session_import error: {e}")
+            await wait_msg.edit_text(f"❌ خطا در تست/ذخیرهٔ سشن: {str(e)[:200]}")
+            try:
+                await test_client.disconnect()
+            except Exception:
+                pass
     
     # ==================== مدیریت تاپیک ====================
     async def admin_topic_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5664,6 +5736,10 @@ class ScannerBot:
             await self.receive_login_password(update, context)
             return
         
+        if context.user_data.get('waiting_for_session_import') and message.text:
+            await self.receive_session_import(update, context)
+            return
+        
         # دریافت فایل TXT
         if context.user_data.get('waiting_for_txt') and message.document:
             await self.scanner.handle_txt_file(update, context)
@@ -5947,6 +6023,9 @@ class ScannerBot:
                 return
             if data == "session_relogin":
                 await self.session_relogin(update, context)
+                return
+            if data == "session_import":
+                await self.session_import(update, context)
                 return
             if data == "session_show_full":
                 await self.session_show_full(update, context)
@@ -6267,6 +6346,11 @@ class ScannerBot:
                 logger.info(f"   👤 Username: @{me.username if me.username else 'None'}")
                 logger.info(f"   🆔 User ID: {me.id}")
                 self.state.session_needs_login = False
+                # اگه سشن از USER_SESSION_STR هاردکد‌شده استفاده شد (نه از
+                # دیتابیس)، همینجا تو دیتابیس هم ذخیره‌ش می‌کنیم تا از این
+                # به بعد پنل «سشن‌ها» و لاگین/ایمپورت آینده هم درست کار کنه.
+                if session_str_to_use == USER_SESSION_STR and (not saved_session or saved_session == "False"):
+                    await self.db.set_scanner_state("user_session_string", session_str_to_use)
             else:
                 logger.error("⚠️ Session غیرفعال/نامعتبر است! ادمین باید در ربات /start بزند تا دوباره لاگین کند.")
                 self.state.session_needs_login = True
