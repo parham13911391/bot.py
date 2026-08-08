@@ -31,11 +31,11 @@ from aiohttp import web
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
 API_ID = 31809598
 API_HASH = "9df12f1fa837a291683e8c5802d82e72"
-USER_SESSION_STR = "1BJWap1wBu16NY_0HcarsQWtZQdZsHvqR22Y9Myy78bTxIADm7h_Xrfn-yzCgp8dwpXhqPrRyoOv3R5RAyqaKBvDbya4f3V-bwFoI0cpYR6SXly2_kbJv3S9VRkoZI5PfPT-wHWBGiRulDXjAqnC8pNYVkJnd7VpCQ_jXRw-NaHhLnLdQ-sdWIU0DlX0mfzk_qZVMlfqSu8831cgdTFmkgBjTsP2YSobS2nN3SrDRvlUXUWknpfkyGjwqPd4s49EuDStDcYPJ60VbjWfb-Fwca_CtAWRx4FCEfH2oXlWkZvxRKCSQCXrWxuoxtlCH2OLONYHkTOkE_sfXbckIjTl5k2e-NdEuZkU="
+USER_SESSION_STR = "1BJWap1wBu6gZELW8wvdU68y67ZB18WdyZPQ0wpsctQl-v9QlotAbCdKNDOTRFqHiS8chqufFWTM-qLhDk3oHsU8CmUYDFX7svhYaUuWnMG-IUYm8tiOqQ0V1xNXo4-6u0G8syFE5pROrya0ORFYiwQYbgOQ9IY124TUcctIlc1KqhB9jiR01Odgp6iMWnHmHH5LB02Qgd6dcgIsAO7uDXU_W27_4Mj_sDLHr72xJ-y8tdN4r5aDFT3r2ELYAnpnRqpWvUlYt4lVzcP40kT_e9el_DIGAhhCMv0tyQfAHvEEHDSbUmLrHV2c1UwIXP11nWqMHRMMHvbx_omDui7m03vkHL_4KnfQ="
 OWNER_ID = 8879869880
 PORT = 8080
 GROQ_API_KEY = "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"
-GITHUB_API_TOKEN = os.environ.get('GITHUB_API_TOKEN', "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")
+GITHUB_API_TOKEN = os.environ.get('GITHUB_API_TOKEN', "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")
 AI_ADMIN_API_KEY = os.environ.get('AI_ADMIN_API_KEY', "sk-air-1aHXL8cLZKvgS6qqeQGsmZNiDPBZPkPECdRcdqLgpBfBlMkA")
 AI_ADMIN_API_URL = "https://api.airforce/v1/chat/completions"
 AI_ADMIN_MODEL = "deepseek-v3"
@@ -532,6 +532,14 @@ class Database:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow('SELECT COUNT(*) FROM sent_configs')
             return row[0] if row else 0
+    
+    async def get_recent_sent_configs(self, limit: int = 10) -> List[Dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT source_channel, location, sent_at FROM sent_configs ORDER BY sent_at DESC LIMIT $1',
+                limit
+            )
+            return [dict(r) for r in rows]
     
     async def cleanup_old_sent(self, days: int = 30) -> Dict[str, int]:
         """پاکسازی رکوردهای قدیمی sent_configs/sent_proxies (فقط برای
@@ -2683,6 +2691,18 @@ class ScannerBot:
                     InlineKeyboardButton("🧹 پاکسازی دیتابیس", callback_data="admin_db_cleanup", style="primary")
                 ],
                 [
+                    InlineKeyboardButton("🧪 تست دستی کانفنیگ/IP", callback_data="admin_manual_test", style="success")
+                ],
+                [
+                    InlineKeyboardButton("📡 مدیریت چنل‌های پروکسی", callback_data="admin_proxy_channels", style="primary")
+                ],
+                [
+                    InlineKeyboardButton("📋 بکاپ تنظیمات", callback_data="admin_settings_backup", style="success")
+                ],
+                [
+                    InlineKeyboardButton("📜 آخرین کانفنیگ‌های ارسالی", callback_data="admin_recent_sent", style="primary")
+                ],
+                [
                     InlineKeyboardButton("🔑 سشن‌ها (فقط مالک)", callback_data="admin_sessions", style="danger")
                 ],
                 [
@@ -3198,18 +3218,39 @@ class ScannerBot:
         response_text = result.get("text", "")
         
         # طبق درخواست: اگه پاسخ بزرگه (مثلاً یه فایل کد کامل)، به‌جای بریدن
-        # پیام یا رد کردن، خودش رو تبدیل به فایل می‌کنه و می‌فرسته.
+        # پیام یا رد کردن، خودش رو تبدیل به فایل می‌کنه و می‌فرسته - و اگه
+        # کد پایتون بود، به‌جای .txt خام، با پسوند .py می‌فرسته.
         if len(response_text) > 3500:
-            file_path = f"/tmp/ai_response_{message.message_id}.txt"
+            # زبان بلوک کد اول رو تشخیص می‌دیم (```python ... ``` یا مشابه)
+            lang_map = {
+                'python': 'py', 'py': 'py', 'javascript': 'js', 'js': 'js',
+                'typescript': 'ts', 'html': 'html', 'css': 'css', 'json': 'json',
+                'bash': 'sh', 'sh': 'sh', 'java': 'java', 'c': 'c', 'cpp': 'cpp',
+                'go': 'go', 'sql': 'sql', 'yaml': 'yaml', 'yml': 'yaml'
+            }
+            m = re.search(r'```(\w+)', response_text)
+            ext = 'txt'
+            if m and m.group(1).lower() in lang_map:
+                ext = lang_map[m.group(1).lower()]
+            elif 'def ' in response_text and 'import' in response_text:
+                ext = 'py'  # اگه فنس کد نداشت ولی واضح پایتونه
+            
+            # اگه پاسخ خودش داخل بلوک کد بود، فقط خودِ کد رو تو فایل بذاریم
+            # نه توضیحات اضافه - تمیزتره برای فایلی که قراره اجرا/استفاده بشه
+            code_blocks = re.findall(r'```(?:\w+)?\n(.*?)```', response_text, re.DOTALL)
+            file_content = code_blocks[0] if (ext != 'txt' and code_blocks and len(code_blocks[0]) > len(response_text) * 0.5) else response_text
+            
+            filename = f"ai_response.{ext}"
+            file_path = f"/tmp/ai_response_{message.message_id}.{ext}"
             with open(file_path, "w", encoding="utf-8") as f:
-                f.write(response_text)
+                f.write(file_content)
             try:
                 await wait_msg.delete()
             except Exception:
                 pass
             await message.reply_document(
                 document=open(file_path, "rb"),
-                filename="ai_response.txt",
+                filename=filename,
                 caption="🤖 پاسخ طولانی بود، به‌صورت فایل فرستادم."
             )
             try:
@@ -3400,6 +3441,204 @@ class ScannerBot:
             f"🗑 پروکسی‌های حذف‌شده: {result['proxies']}",
             reply_markup=keyboard
         )
+    
+    # ==================== ۴ قابلیت جدید صفحه ۲ ====================
+    
+    # ۱) تست دستی کانفنیگ/IP
+    async def admin_manual_test_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        context.user_data['waiting_for_manual_test'] = True
+        await query.message.reply_text(
+            "🧪 یه کانفنیگ کامل (vless/vmess/trojan/hy2) یا فقط `IP:PORT` بفرست تا "
+            "همین الان با همون تست چندلایه (فرمت → IP خصوصی/محلی → DNS → اتصال TCP واقعی + پینگ) "
+            "و لوکیشن بررسیش کنم - بدون اینکه چیزی فوروارد بشه.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def receive_manual_test(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        text = (message.text or "").strip()
+        context.user_data['waiting_for_manual_test'] = False
+        
+        wait_msg = await message.reply_text("🧪 در حال تست...")
+        
+        host, port = None, None
+        if '://' in text:
+            host = await self.scanner.extract_host(text)
+            port = await self.scanner.extract_port(text)
+        else:
+            m = re.match(r'^([^\s:]+):(\d+)$', text)
+            if m:
+                host, port = m.group(1), int(m.group(2))
+        
+        if not host or not port:
+            await wait_msg.edit_text("❌ نتونستم host/port رو ازش دربیارم. یا کانفنیگ کامل بفرست یا فرمت `IP:PORT`.")
+            return
+        
+        is_alive, ping_ms = await self.scanner.check_config_health(host, port)
+        location = await self.scanner.get_ip_info(host) if is_alive else {'country': 'Unknown', 'city': 'Unknown'}
+        flag = self.scanner.get_country_flag(location.get('countryCode', ''))
+        
+        if is_alive:
+            await wait_msg.edit_text(
+                f"✅ **زنده و در دسترس**\n\n"
+                f"🌐 {host}:{port}\n"
+                f"⚡️ پینگ: {ping_ms}ms\n"
+                f"📍 لوکیشن: {flag} {location.get('country', 'Unknown')}\n"
+                f"🏙️ شهر: {location.get('city', 'Unknown')}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await wait_msg.edit_text(f"🔴 **مرده/در دسترس نیست**\n\n🌐 {host}:{port}\n\nهیچ فورواردی انجام نمی‌شد.", parse_mode=ParseMode.MARKDOWN)
+    
+    # ۲) مدیریت چنل‌های پروکسی (همون الگوی چنل‌های کانفنیگ)
+    async def admin_proxy_channels_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        
+        channels_list = "\n".join(f"{i+1}. {ch}" for i, ch in enumerate(SOURCE_PROXY_CHANNELS)) or "(خالی)"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ افزودن چنل پروکسی", callback_data="proxy_channel_add", style="primary")],
+            [InlineKeyboardButton("➖ حذف چنل پروکسی", callback_data="proxy_channel_remove", style="primary")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_page_2", style="success")]
+        ])
+        await self.safe_edit_message_text(
+            query,
+            f"📡 **چنل‌های منبع پروکسی** ({len(SOURCE_PROXY_CHANNELS)})\n\n{channels_list}",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def proxy_channel_add_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if not self.state.is_admin(query.from_user.id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        context.user_data['waiting_for_proxy_channel_add'] = True
+        await query.message.reply_text("➕ لینک یا یوزرنیم چنل پروکسی رو بفرست:")
+    
+    async def receive_proxy_channel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        text = (message.text or "").strip()
+        context.user_data['waiting_for_proxy_channel_add'] = False
+        
+        username = None
+        m = re.search(r't\.me/([A-Za-z0-9_]+)', text)
+        if m:
+            username = m.group(1)
+        elif text.startswith('@'):
+            username = text[1:]
+        elif re.match(r'^[A-Za-z0-9_]+$', text):
+            username = text
+        
+        if not username:
+            await message.reply_text("❌ لینک/یوزرنیم معتبر نبود.")
+            return
+        
+        normalized = f"@{username}"
+        if normalized.lower() in [c.lower() for c in SOURCE_PROXY_CHANNELS]:
+            await message.reply_text(f"⚠️ چنل {normalized} از قبل تو لیست هست.")
+            return
+        
+        SOURCE_PROXY_CHANNELS.append(normalized)
+        await self.db.set_scanner_state("proxy_scan_channels", json.dumps(SOURCE_PROXY_CHANNELS))
+        await message.reply_text(f"✅ چنل {normalized} اضافه شد.\n\nلیست فعلی:\n" + "\n".join(f"{i+1}. {ch}" for i, ch in enumerate(SOURCE_PROXY_CHANNELS)))
+    
+    async def proxy_channel_remove_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if not self.state.is_admin(query.from_user.id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        if not SOURCE_PROXY_CHANNELS:
+            await query.message.reply_text("❌ لیست خالیه.")
+            return
+        context.user_data['waiting_for_proxy_channel_remove'] = True
+        channels_list = "\n".join(f"{i+1}. {ch}" for i, ch in enumerate(SOURCE_PROXY_CHANNELS))
+        await query.message.reply_text(f"➖ عدد چنلی که می‌خوای حذف بشه رو بفرست:\n\n{channels_list}")
+    
+    async def receive_proxy_channel_remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        text = (message.text or "").strip()
+        context.user_data['waiting_for_proxy_channel_remove'] = False
+        
+        if not text.isdigit():
+            await message.reply_text("❌ فقط عدد بفرست.")
+            return
+        idx = int(text) - 1
+        if idx < 0 or idx >= len(SOURCE_PROXY_CHANNELS):
+            await message.reply_text("❌ عدد نامعتبره.")
+            return
+        
+        removed = SOURCE_PROXY_CHANNELS.pop(idx)
+        await self.db.set_scanner_state("proxy_scan_channels", json.dumps(SOURCE_PROXY_CHANNELS))
+        remaining = "\n".join(f"{i+1}. {ch}" for i, ch in enumerate(SOURCE_PROXY_CHANNELS)) or "(خالی)"
+        await message.reply_text(f"✅ چنل {removed} حذف شد.\n\nلیست فعلی:\n{remaining}")
+    
+    # ۳) بکاپ تنظیمات
+    async def admin_settings_backup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if not self.state.is_admin(query.from_user.id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer("در حال ساخت بکاپ...")
+        
+        backup = {
+            "exported_at": datetime.now().isoformat(),
+            "config_scan_channels": self.state.config_scan_channels,
+            "proxy_scan_channels": SOURCE_PROXY_CHANNELS,
+            "prices": PRICES,
+            "config_topic_id": CONFIG_TOPIC_ID,
+            "group_id": GROUP_ID,
+            "send_to_topic_enabled": self.state.send_to_topic_enabled,
+        }
+        file_path = f"/tmp/settings_backup_{int(time.time())}.json"
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(backup, f, ensure_ascii=False, indent=2)
+        
+        await query.message.reply_document(
+            document=open(file_path, "rb"),
+            filename="settings_backup.json",
+            caption="📋 بکاپ تنظیمات فعلی (فقط برای مطالعه/نگه‌داری - برای بازگردانی باید دستی اعمال بشه)."
+        )
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+    
+    # ۴) آخرین کانفنیگ‌های ارسالی
+    async def admin_recent_sent(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if not self.state.is_admin(query.from_user.id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        
+        rows = await self.db.get_recent_sent_configs(limit=10)
+        if not rows:
+            text = "📜 هنوز هیچ کانفنیگی ارسال نشده."
+        else:
+            lines = ["📜 **۱۰ کانفنیگ آخر ارسالی:**\n"]
+            for r in rows:
+                ch = (r.get('source_channel') or '-').replace('_', '\\_')
+                loc = r.get('location') or 'Unknown'
+                sent_at = r.get('sent_at')
+                time_str = sent_at.strftime('%H:%M %m-%d') if sent_at else '-'
+                lines.append(f"• {ch} — {loc} — {time_str}")
+            text = "\n".join(lines)
+        
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_page_2", style="success")]])
+        await self.safe_edit_message_text(query, text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
     
     async def admin_sessions_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """طبق درخواست: فقط مالک اصلی (نه ادمین‌های دیگه) می‌تونه سشن فعلی
@@ -6262,6 +6501,18 @@ class ScannerBot:
             await self.receive_price_edit(update, context)
             return
         
+        if context.user_data.get('waiting_for_manual_test') and message.text:
+            await self.receive_manual_test(update, context)
+            return
+        
+        if context.user_data.get('waiting_for_proxy_channel_add') and message.text:
+            await self.receive_proxy_channel_add(update, context)
+            return
+        
+        if context.user_data.get('waiting_for_proxy_channel_remove') and message.text:
+            await self.receive_proxy_channel_remove(update, context)
+            return
+        
         # دریافت فایل TXT
         if context.user_data.get('waiting_for_txt') and message.document:
             await self.scanner.handle_txt_file(update, context)
@@ -6560,6 +6811,24 @@ class ScannerBot:
                 return
             if data.startswith("priceedit_"):
                 await self.price_edit_select(update, context)
+                return
+            if data == "admin_manual_test":
+                await self.admin_manual_test_prompt(update, context)
+                return
+            if data == "admin_proxy_channels":
+                await self.admin_proxy_channels_panel(update, context)
+                return
+            if data == "proxy_channel_add":
+                await self.proxy_channel_add_prompt(update, context)
+                return
+            if data == "proxy_channel_remove":
+                await self.proxy_channel_remove_prompt(update, context)
+                return
+            if data == "admin_settings_backup":
+                await self.admin_settings_backup(update, context)
+                return
+            if data == "admin_recent_sent":
+                await self.admin_recent_sent(update, context)
                 return
             if data == "session_relogin":
                 await self.session_relogin(update, context)
@@ -6888,6 +7157,17 @@ class ScannerBot:
                 except Exception:
                     pass
             
+            # چنل‌های پروکسی هم از دیتابیس (اگه از پنل مدیریت تغییر داده شده)
+            proxy_channels_raw = await self.db.get_scanner_state("proxy_scan_channels")
+            if proxy_channels_raw and proxy_channels_raw != "False":
+                try:
+                    loaded_proxy = json.loads(proxy_channels_raw)
+                    if isinstance(loaded_proxy, list) and loaded_proxy:
+                        SOURCE_PROXY_CHANNELS.clear()
+                        SOURCE_PROXY_CHANNELS.extend(loaded_proxy)
+                except Exception:
+                    pass
+            
             logger.info(f"📂 Scanner states - Config: {self.state.config_scanner_running}, Proxy: {self.state.proxy_scanner_running}, TXT: {self.state.txt_scanner_running}, GitHub: {self.state.github_scanner_running}")
         except Exception as e:
             logger.error(f"Error loading scanner states: {e}")
@@ -6905,25 +7185,51 @@ class ScannerBot:
         # ادمین می‌تواند با زدن /start شماره و کد تایید را وارد کند تا
         # سشن جدید ساخته شود - بدون نیاز به ری‌دیپلوی یا ادیت کد.
         saved_session = await self.db.get_scanner_state("user_session_string")
-        session_str_to_use = saved_session if saved_session and saved_session != "False" else USER_SESSION_STR
+        # === منطق نهایی انتخاب سشن ===
+        # هم از پنل «سشن‌ها»/اسکریپت مستقل (که مستقیم تو دیتابیس می‌نویسن)
+        # باید بدون ادیت کد کار کنه، هم از هاردکد کردن تو خودِ فایل. پس اول
+        # سشن دیتابیس رو امتحان می‌کنیم (چون معمولاً جدیدتره)؛ اگه معتبر
+        # نبود (باطل/خالی)، سراغ USER_SESSION_STر هاردکدشده می‌ریم؛ در نهایت
+        # دیتابیس رو با هرکدوم که واقعاً کار کرد هماهنگ می‌کنیم.
+        candidates = []
+        if saved_session and saved_session != "False":
+            candidates.append(saved_session)
+        if USER_SESSION_STR and USER_SESSION_STR not in candidates:
+            candidates.append(USER_SESSION_STR)
         
-        self.user_client = TelegramClient(StringSession(session_str_to_use), API_ID, API_HASH)
+        self.user_client = None
+        session_str_to_use = ""
+        for candidate in candidates:
+            test_client = TelegramClient(StringSession(candidate), API_ID, API_HASH)
+            try:
+                await test_client.connect()
+                if await test_client.is_user_authorized():
+                    self.user_client = test_client
+                    session_str_to_use = candidate
+                    break
+                else:
+                    await test_client.disconnect()
+            except Exception as e:
+                logger.error(f"⚠️ Session candidate failed: {e}")
+                try:
+                    await test_client.disconnect()
+                except Exception:
+                    pass
+        
         try:
-            await self.user_client.connect()
-            if session_str_to_use and await self.user_client.is_user_authorized():
+            if self.user_client is not None:
                 me = await self.user_client.get_me()
                 logger.info(f"✅ Scanner client connected!")
                 logger.info(f"   👤 Username: @{me.username if me.username else 'None'}")
                 logger.info(f"   🆔 User ID: {me.id}")
                 self.state.session_needs_login = False
-                # اگه سشن از USER_SESSION_STR هاردکد‌شده استفاده شد (نه از
-                # دیتابیس)، همینجا تو دیتابیس هم ذخیره‌ش می‌کنیم تا از این
-                # به بعد پنل «سشن‌ها» و لاگین/ایمپورت آینده هم درست کار کنه.
-                if session_str_to_use == USER_SESSION_STR and (not saved_session or saved_session == "False"):
+                if saved_session != session_str_to_use:
                     await self.db.set_scanner_state("user_session_string", session_str_to_use)
             else:
                 logger.error("⚠️ Session غیرفعال/نامعتبر است! ادمین باید در ربات /start بزند تا دوباره لاگین کند.")
                 self.state.session_needs_login = True
+                self.user_client = TelegramClient(StringSession(), API_ID, API_HASH)
+                await self.user_client.connect()
         except Exception as e:
             logger.error(f"❌ Scanner client error: {e}")
             logger.error("⚠️ ادمین باید در ربات /start بزند تا دوباره لاگین کند.")
