@@ -528,6 +528,23 @@ class Database:
             row = await conn.fetchrow('SELECT COUNT(*) FROM sent_configs')
             return row[0] if row else 0
     
+    async def cleanup_old_sent(self, days: int = 30) -> Dict[str, int]:
+        """پاکسازی رکوردهای قدیمی sent_configs/sent_proxies (فقط برای
+        جلوگیری از بزرگ‌شدن بی‌رویهٔ دیتابیس - چون دی‌دوپ فقط برای رد
+        نکردن یک کانفنیگ تکراریِ *اخیر* لازمه، نه نگه‌داشتن تا ابد)."""
+        async with self.pool.acquire() as conn:
+            r1 = await conn.execute(f"DELETE FROM sent_configs WHERE sent_at < NOW() - INTERVAL '{int(days)} days'")
+            r2 = await conn.execute(f"DELETE FROM sent_proxies WHERE sent_at < NOW() - INTERVAL '{int(days)} days'")
+            try:
+                deleted_configs = int(r1.split()[-1])
+            except Exception:
+                deleted_configs = 0
+            try:
+                deleted_proxies = int(r2.split()[-1])
+            except Exception:
+                deleted_proxies = 0
+            return {'configs': deleted_configs, 'proxies': deleted_proxies}
+    
     # ==================== متدهای پروکسی ارسال شده ====================
     async def add_sent_proxy(self, proxy_url: str, proxy_hash: str, source_channel: str,
                               location: str = None, country: str = None, sent_to_topic: bool = False):
@@ -1086,6 +1103,7 @@ class ChannelScanner:
         self._txt_task = None
         self._github_sending = False
         self._github_task = None
+        self._github_401_notified = False
     
     async def poll_forward_loop(self):
         """فورارد بر اساس Polling (طبق درخواست شما): هر ۴۰ ثانیه یک‌بار آخرین
@@ -2036,6 +2054,21 @@ class ChannelScanner:
                             logger.error(f"⚠️ Could not notify admin {admin_id}: {e}")
                 else:
                     logger.error(f"❌ GitHub topic scan failed: {result.get('error')}")
+                    # طبق درخواست قبلی، توکن گیت‌هابی که تو چت پیست شده بود
+                    # باید Revoke بشه - اگه این کار انجام شده و توکن جدید
+                    # جایگزین نشده، اینجا با خطای 401 مواجه می‌شیم. یه بار
+                    # به ادمین اطلاع می‌دیم (نه هر ساعت، که اسپم نشه).
+                    if "401" in str(result.get('error', '')) and not self._github_401_notified:
+                        self._github_401_notified = True
+                        for admin_id in self.state.admins:
+                            try:
+                                await self.bot_app.bot.send_message(
+                                    admin_id,
+                                    "⚠️ اسکن خودکار گیت‌هاب متوقفه: توکن گیت‌هاب (GITHUB_API_TOKEN) دیگه معتبر نیست "
+                                    "(HTTP 401 - احتمالاً Revoke شده). یه توکن جدید بساز و جای مقدار قبلی تو کد بذار."
+                                )
+                            except Exception:
+                                pass
             except Exception as e:
                 logger.error(f"❌ GitHub topic scan loop error: {e}")
             
@@ -2538,6 +2571,12 @@ class ScannerBot:
                     InlineKeyboardButton("GitHub", callback_data="admin_github", style="danger")
                 ],
                 [
+                    InlineKeyboardButton("🩺 وضعیت سلامت سیستم", callback_data="admin_health", style="success")
+                ],
+                [
+                    InlineKeyboardButton("🧹 پاکسازی دیتابیس", callback_data="admin_db_cleanup", style="primary")
+                ],
+                [
                     InlineKeyboardButton("🔑 سشن‌ها (فقط مالک)", callback_data="admin_sessions", style="danger")
                 ],
                 [
@@ -3015,6 +3054,115 @@ class ScannerBot:
             )
     
     # ==================== سشن‌ها (فقط مالک) ====================
+    # ==================== وضعیت سلامت سیستم (جدید) ====================
+    async def admin_health_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """یه داشبورد یک‌جا که همون چیزایی که تو این چند روز مدام از رو لاگ
+        دستی چک می‌کردیم (سشن، وضعیت اسکنرها، تاپیک، تعداد چنل‌ها، توکن
+        گیت‌هاب و...) رو یک‌جا نشون می‌ده - بدون نیاز به گرفتن فایل لاگ."""
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer("در حال بررسی...")
+        
+        lines = ["🩺 **وضعیت سلامت سیستم**\n"]
+        
+        # سشن
+        if self.user_client is not None and not self.state.session_needs_login:
+            try:
+                me = await self.user_client.get_me()
+                lines.append(f"🟢 سشن: متصل (@{me.username if me and me.username else me.id})")
+            except Exception:
+                lines.append("🟡 سشن: ذخیره شده ولی الان قابل تایید نیست")
+        else:
+            lines.append("🔴 سشن: لاگین نشده")
+        
+        # وضعیت گروه/تاپیک
+        if self.user_client is not None and not self.state.session_needs_login:
+            try:
+                group_entity = await self.user_client.get_entity(GROUP_ID)
+                lines.append("🟢 عضویت در گروه هدف: تایید شد")
+                try:
+                    from telethon.tl.functions.channels import GetForumTopicsRequest
+                    topics_result = await self.user_client(GetForumTopicsRequest(
+                        channel=group_entity, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                    ))
+                    topic_ids = [t.id for t in topics_result.topics]
+                    if CONFIG_TOPIC_ID in topic_ids:
+                        lines.append(f"🟢 تاپیک هدف ({CONFIG_TOPIC_ID}): معتبره")
+                    else:
+                        lines.append(f"🔴 تاپیک هدف ({CONFIG_TOPIC_ID}): تو لیست تاپیک‌های گروه نیست!")
+                except Exception:
+                    lines.append("🟡 تاپیک هدف: نشد چک بشه")
+            except Exception:
+                lines.append("🔴 عضویت در گروه هدف: اکانت اسکنر عضو نیست")
+        
+        lines.append(f"{'🟢' if self.state.send_to_topic_enabled else '🔴'} ارسال به تاپیک: {'روشن' if self.state.send_to_topic_enabled else 'خاموش'}")
+        lines.append("")
+        
+        # اسکنرها
+        lines.append(f"{'🟢' if self.state.config_scanner_running else '🔴'} اسکنر کانفنیگ: {'روشن' if self.state.config_scanner_running else 'خاموش'} ({len(self.state.config_scan_channels)} چنل)")
+        lines.append(f"{'🟢' if self.state.proxy_scanner_running else '🔴'} اسکنر پروکسی: {'روشن' if self.state.proxy_scanner_running else 'خاموش'} ({len(SOURCE_PROXY_CHANNELS)} چنل)")
+        lines.append(f"{'🟢' if self.state.txt_scanner_running else '🔴'} اسکنر TXT: {'روشن' if self.state.txt_scanner_running else 'خاموش'}")
+        lines.append(f"{'🟢' if self.state.github_scanner_running else '🔴'} ارسال صف گیت‌هاب: {'روشن' if self.state.github_scanner_running else 'خاموش'}")
+        lines.append(f"{'🟢' if GITHUB_API_TOKEN else '🔴'} توکن اسکن خودکار گیت‌هاب: {'تنظیم شده' if GITHUB_API_TOKEN else 'تنظیم نشده'}")
+        lines.append("")
+        
+        sent_configs = await self.db.get_sent_configs_count()
+        github_stats = await self.db.get_github_queue_stats()
+        lines.append(f"📤 کل کانفنیگ ارسال‌شده: {sent_configs}")
+        lines.append(f"📦 صف گیت‌هاب: {github_stats.get('remaining', 0)} باقیمانده / {github_stats.get('sent', 0)} ارسال‌شده")
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 بروزرسانی", callback_data="admin_health", style="primary")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_page_2", style="success")]
+        ])
+        
+        await self.safe_edit_message_text(query, "\n".join(lines), reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    
+    # ==================== پاکسازی دیتابیس (جدید) ====================
+    async def admin_db_cleanup_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer()
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧹 پاک کردن رکوردهای قدیمی‌تر از ۳۰ روز", callback_data="db_cleanup_confirm", style="danger")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_page_2", style="success")]
+        ])
+        await self.safe_edit_message_text(
+            query,
+            "🧹 **پاکسازی دیتابیس**\n\n"
+            "این کار فقط رکوردهای «کانفنیگ/پروکسیِ ارسال‌شده» که بیشتر از ۳۰ روز ازشون گذشته رو پاک می‌کنه "
+            "(فقط برای جلوگیری از حجیم شدن بی‌خودی دیتابیس - روی چنل‌ها، تنظیمات، سشن یا صف گیت‌هاب اثری نداره).",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def db_cleanup_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer("در حال پاکسازی...")
+        
+        result = await self.db.cleanup_old_sent(days=30)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel_page_2", style="success")]
+        ])
+        await self.safe_edit_message_text(
+            query,
+            f"✅ پاکسازی انجام شد.\n\n"
+            f"🗑 کانفنیگ‌های حذف‌شده: {result['configs']}\n"
+            f"🗑 پروکسی‌های حذف‌شده: {result['proxies']}",
+            reply_markup=keyboard
+        )
+    
     async def admin_sessions_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """طبق درخواست: فقط مالک اصلی (نه ادمین‌های دیگه) می‌تونه سشن فعلی
         اکانت اسکنر رو ببینه و/یا دوباره لاگین کنه تا سشن جدید ساخته و
@@ -5015,9 +5163,19 @@ class ScannerBot:
         ])
         
         sent_count = await self.db.get_sent_configs_count()
-        channels_list = "\n".join(f"{i+1}. {ch}" for i, ch in enumerate(self.state.config_scan_channels)) or "(هیچ چنلی تنظیم نشده)"
+        # === رفع باگ اصلیِ «دکمه اسکنر کانفنیگ کار نمی‌کنه» ===
+        # یوزرنیم چنل‌ها معمولاً آندرلاین دارن (مثل Farah_VPN)، و تو
+        # Markdown قدیمی، آندرلاین یعنی شروع italic - اگه جفت نشه، تلگرام
+        # کل پیام رو با خطای "can't find end of the entity" رد می‌کنه و
+        # پیام اصلاً ادیت نمی‌شه (دکمه انگار کار نمی‌کنه). این‌جا
+        # آندرلاین‌های تو اسم چنل رو escape می‌کنیم.
+        def _md_escape(s: str) -> str:
+            return s.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', "'")
         
-        await query.edit_message_text(
+        channels_list = "\n".join(f"{i+1}. {_md_escape(ch)}" for i, ch in enumerate(self.state.config_scan_channels)) or "(هیچ چنلی تنظیم نشده)"
+        
+        await self.safe_edit_message_text(
+            query,
             f"🎯 **اسکنر کانفنیگ**\n\n"
             f"وضعیت: {status}\n"
             f"چنل‌ها ({len(self.state.config_scan_channels)}):\n{channels_list}\n\n"
@@ -6137,6 +6295,15 @@ class ScannerBot:
                 return
             if data == "admin_sessions":
                 await self.admin_sessions_panel(update, context)
+                return
+            if data == "admin_health":
+                await self.admin_health_panel(update, context)
+                return
+            if data == "admin_db_cleanup":
+                await self.admin_db_cleanup_panel(update, context)
+                return
+            if data == "db_cleanup_confirm":
+                await self.db_cleanup_confirm(update, context)
                 return
             if data == "session_relogin":
                 await self.session_relogin(update, context)
