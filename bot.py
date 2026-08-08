@@ -27,8 +27,8 @@ from aiohttp import web
 
 # ==================== تنظیمات اصلی (جدید) ====================
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
-API_ID = 31809598
-API_HASH = "9df12f1fa837a291683e8c5802d82e72"
+API_ID = 32233583
+API_HASH = "ce6caac5e6e987ff33fc613d076570a4"
 USER_SESSION_STR = ""  # طبق درخواست: سشنِ قدیمیِ غیرفعال حذف شد - سشن واقعی همیشه از دیتابیس (ست‌شده توسط لاگین از داخل خود ربات) خونده می‌شه
 OWNER_ID = 8879869880
 PORT = 8080
@@ -5041,6 +5041,31 @@ class ScannerBot:
         wait_msg = await message.reply_text("🔄 در حال ارسال کد تایید...")
         
         try:
+            # === رفع باگ «کد الکی/منقضی‌شده» ===
+            # این خطا معمولاً وقتی می‌افته که یه send_code_request دوم
+            # (مثلاً به‌خاطر دو نمونهٔ هم‌زمان ربات، یا دوباره زدن /start)
+            # کدِ قبلی رو باطل می‌کنه؛ کاربر کد اول رو وارد می‌کنه ولی
+            # دیگه معتبر نیست. راه‌حل: اطلاعات لاگین (شماره/hash/زمان) رو
+            # تو دیتابیس نگه می‌داریم (نه فقط تو حافظهٔ همین پردازش) و اگه
+            # همین شماره اخیراً (کمتر از ۹۰ ثانیه پیش) کد گرفته، کد جدید
+            # درخواست نمی‌کنیم - همون hash قبلی رو دوباره استفاده می‌کنیم؛
+            # این‌طوری حتی اگه یه نمونهٔ دیگه از ربات هم همین پیام رو گرفته
+            # باشه، کد دوباره باطل نمی‌شه.
+            pending_raw = await self.db.get_scanner_state("login_pending")
+            pending = json.loads(pending_raw) if pending_raw and pending_raw != "False" else None
+            
+            now_ts = time.time()
+            if pending and pending.get('phone') == phone and (now_ts - pending.get('ts', 0)) < 90:
+                self.state.login_phone = phone
+                self.state.login_phone_code_hash = pending.get('hash')
+                context.user_data['waiting_for_login_code'] = True
+                await wait_msg.edit_text(
+                    "✅ کد تایید قبلاً برای همین شماره فرستاده شده (چند ثانیه پیش).\n\n"
+                    "🔢 لطفاً همون کد رو وارد کنید (فقط عدد):\n"
+                    "توجه: اگر تلگرام بین رقم‌ها فاصله گذاشت، بدون فاصله وارد کنید."
+                )
+                return
+            
             # === رفع اصلیِ باگ «خطا در ارسال کد» ===
             # قبلاً send_code_request روی self.user_client (همان سشن قدیمیِ
             # از کار افتاده) صدا زده می‌شد. وقتی تلگرام یک سشن را به‌خاطر
@@ -5064,10 +5089,15 @@ class ScannerBot:
             self.state.login_phone_code_hash = sent.phone_code_hash
             context.user_data['waiting_for_login_code'] = True
             
+            await self.db.set_scanner_state("login_pending", json.dumps({
+                'phone': phone, 'hash': sent.phone_code_hash, 'ts': now_ts
+            }))
+            
             await wait_msg.edit_text(
                 "✅ کد تایید به تلگرام همان اکانت ارسال شد.\n\n"
                 "🔢 لطفاً کد را وارد کنید (فقط عدد):\n"
-                "توجه: اگر تلگرام بین رقم‌ها فاصله گذاشت، بدون فاصله وارد کنید."
+                "توجه: اگر تلگرام بین رقم‌ها فاصله گذاشت، بدون فاصله وارد کنید.\n"
+                "⚠️ فقط همین کدو وارد کن - اگه دوباره /start بزنی یا شماره رو دوباره بفرستی، کد باطل می‌شه."
             )
         except Exception as e:
             logger.error(f"❌ send_code_request error: {e}")
@@ -5084,21 +5114,58 @@ class ScannerBot:
         try:
             from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
             
+            # === مقاوم در برابر ری‌استارت/چند نمونه ===
+            # اگه self.login_client یا self.state.login_phone_code_hash تو
+            # حافظهٔ همین پردازش خالی/متفاوت بود (مثلاً چون بین «ارسال کد»
+            # و «وارد کردن کد» یه ری‌استارت یا سوییچ نمونه اتفاق افتاده)،
+            # همون اطلاعات pending رو از دیتابیس می‌خونیم و اگه لازم بود یه
+            # کلاینت تازه می‌سازیم - sign_in فقط به phone_code_hash معتبر
+            # نیاز داره، نه لزوماً همون کانکشنی که کد رو گرفته.
+            phone = self.state.login_phone
+            code_hash = self.state.login_phone_code_hash
+            
+            if not phone or not code_hash:
+                pending_raw = await self.db.get_scanner_state("login_pending")
+                pending = json.loads(pending_raw) if pending_raw and pending_raw != "False" else None
+                if pending:
+                    phone = pending.get('phone')
+                    code_hash = pending.get('hash')
+            
+            if not phone or not code_hash:
+                await wait_msg.edit_text("❌ اطلاعات ورود پیدا نشد (شاید خیلی طول کشید). لطفاً دوباره از /start شروع کن.")
+                return
+            
+            if self.login_client is None:
+                self.login_client = TelegramClient(StringSession(), API_ID, API_HASH)
+                await self.login_client.connect()
+            elif not self.login_client.is_connected():
+                await self.login_client.connect()
+            
             try:
                 await self.login_client.sign_in(
-                    phone=self.state.login_phone,
+                    phone=phone,
                     code=code,
-                    phone_code_hash=self.state.login_phone_code_hash
+                    phone_code_hash=code_hash
                 )
             except SessionPasswordNeededError:
+                self.state.login_phone = phone
+                self.state.login_phone_code_hash = code_hash
                 context.user_data['waiting_for_login_password'] = True
                 await wait_msg.edit_text("🔐 این اکانت رمز دو مرحله‌ای (2FA) دارد.\nلطفاً رمز را وارد کنید:")
                 return
             
+            await self.db.set_scanner_state("login_pending", "False")
             await self._finish_session_login(update, wait_msg)
             
         except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-            await wait_msg.edit_text(f"❌ کد اشتباه یا منقضی‌شده است: {e}\n\nبرای شروع دوباره /start را بزنید.")
+            await self.db.set_scanner_state("login_pending", "False")
+            await wait_msg.edit_text(
+                f"❌ کد اشتباه یا منقضی‌شده است: {e}\n\n"
+                f"این معمولاً یعنی یا کد رو دیر وارد کردی، یا یه درخواست کد دیگه (مثلاً دوباره زدن /start) کد قبلی رو باطل کرده.\n"
+                f"اگه این پیام مکرر میاد با اینکه سریع کد رو وارد می‌کنی، احتمالاً دو نمونه از ربات هم‌زمان روشنه - "
+                f"تو Railway مطمئن شو فقط ۱ Replica/Deployment فعاله.\n\n"
+                f"برای شروع دوباره /start را بزنید."
+            )
         except Exception as e:
             logger.error(f"❌ sign_in error: {e}")
             await wait_msg.edit_text(f"❌ خطا: {str(e)[:200]}\n\nبرای شروع دوباره /start را بزنید.")
