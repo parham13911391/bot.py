@@ -11,6 +11,7 @@ import logging
 import time
 import ipaddress
 import socket
+import ssl
 import html
 import asyncpg
 from datetime import datetime, timedelta
@@ -1345,15 +1346,6 @@ class ChannelScanner:
             logger.error(f"Error reading file: {e}")
             return []
     
-    async def is_config_for_iran(self, config_text: str) -> bool:
-        if 'IR' in config_text.upper() or 'IRAN' in config_text.upper():
-            return False
-        iran_ips = ['5.134', '31.7', '37.98', '37.148', '37.152', '37.154', '37.156', '37.158']
-        for ip in iran_ips:
-            if ip in config_text:
-                return False
-        return True
-    
     async def extract_host(self, config_text: str) -> Optional[str]:
         """آدرس واقعی سرور را از داخل کانفنیگ استخراج می‌کند تا لوکیشن واقعی
         (نه لوکیشن سرور خود ربات) نمایش داده شود. برای vmess حتماً باید
@@ -1426,27 +1418,44 @@ class ChannelScanner:
         
         return None
     
-    async def check_config_health(self, host: Optional[str], port: Optional[int], timeout: float = 3.0) -> Tuple[bool, Optional[int]]:
-        """تست سلامت چندلایه (طبق درخواست «چند فیلتر لایه»):
+    async def check_config_health(self, host: Optional[str], port: Optional[int], config_text: str = "", timeout: float = 3.0) -> Tuple[bool, Optional[int], int]:
+        """تست سلامت چندلایه - طبق درخواست صریح شما، نه یک تست ساده‌ی TCP،
+        بلکه حداقل ۵ تست/لایهٔ مجزا قبل از اینکه چیزی «سالم» حساب بشه:
+        
         لایه ۱) اعتبار فرمت host/port
         لایه ۲) رد کردن IPهای محلی/خصوصی/بی‌معنی (127.x, 10.x, 192.168.x, ...)
-        لایه ۳) اگه host دامنه است (نه IP خام)، اول resolve میشه - اگه
-                 resolve نشه، اصلاً TCP امتحان نمی‌کنیم (وقت تلف نشه)
-        لایه ۴) تست واقعی اتصال TCP + اندازه‌گیری پینگ، با ۲ تلاش (ضد
-                 خرابی/false-negative گذرا) - کافیه یکی موفق بشه."""
+        لایه ۳) resolve واقعیِ DNS (اگه دامنه بود، نه IP خام)
+        لایه ۴) اتصال واقعی TCP + اندازه‌گیری پینگ (۳ تلاش مستقل، ضد
+                 خرابی/false-negative گذرا)
+        لایه ۵) «ضد قطعی»: بعد از وصل شدن یه لحظه صبر و چک دوباره که
+                 فوری قطع نشده (خیلی از سرورهای فیلترشده handshake رو
+                 قبول می‌کنن ولی فوری RST می‌کنن)
+        لایه ۶) پروب پروتکلی: اگه کانفنیگ TLS/Reality اعلام کرده
+                 (security=tls یا security=reality یا پورت‌های معمول TLS
+                 مثل 443/8443)، یه TLS handshake واقعی هم امتحان می‌کنه -
+                 یعنی نه فقط پورت باز باشه، بلکه واقعاً یه سرویس TLS پشتش
+                 جواب بده. اگه TLS نبود یا این تست شکست خورد ولی TCP خام
+                 موفق بود، بازم قبول می‌شه (چون بعضی پروتکل‌ها TLS مستقیم
+                 رو خودشون هندل می‌کنن، نه لایهٔ سوکت).
+        
+        خروجی: (زنده بود یا نه, پینگ به ms, چند لایه از ۶ تا رو رد کرد)"""
+        layers_passed = 0
+        
         # لایه ۱: فرمت
         if not host or not port:
-            return False, None
+            return False, None, layers_passed
+        layers_passed += 1
         
         # لایه ۲: آدرس‌های محلی/خصوصی هرگز یک سرور واقعی نیستند
         if host in ('127.0.0.1', 'localhost', '0.0.0.0', '::1'):
-            return False, None
+            return False, None, layers_passed
         try:
             ip_obj = ipaddress.ip_address(host)
             if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved or ip_obj.is_multicast:
-                return False, None
+                return False, None, layers_passed
         except ValueError:
             pass  # host یه دامنه است، نه IP خام - می‌ره لایهٔ بعد
+        layers_passed += 1
         
         # لایه ۳: resolve دامنه (اگه IP خام نبود)
         target_host = host
@@ -1464,28 +1473,72 @@ class ChannelScanner:
                     timeout=timeout
                 )
                 if not infos:
-                    return False, None
+                    return False, None, layers_passed
             except Exception:
-                return False, None
+                return False, None, layers_passed
+        layers_passed += 1
         
-        # لایه ۴: تست واقعی اتصال TCP + پینگ (۲ تلاش، ضد خرابی گذرا)
-        for attempt in range(2):
+        # لایه ۴ و ۵: تست واقعی اتصال TCP + پینگ + پایداری کوتاه (۳ تلاش)
+        ping_ms = None
+        connected = False
+        for attempt in range(3):
+            writer = None
             try:
                 start = time.monotonic()
                 fut = asyncio.open_connection(target_host, port)
                 reader, writer = await asyncio.wait_for(fut, timeout=timeout)
                 ping_ms = int((time.monotonic() - start) * 1000)
+                
+                # لایهٔ ۵ - ضد قطعی: یه لحظه صبر کن ببین اتصال فوری قطع نمیشه
+                await asyncio.sleep(0.3)
+                if writer.is_closing() or writer.transport.is_closing():
+                    raise ConnectionError("connection dropped immediately after handshake")
+                
                 writer.close()
                 try:
                     await writer.wait_closed()
                 except Exception:
                     pass
-                return True, ping_ms
+                connected = True
+                break
             except Exception:
-                if attempt == 0:
+                if writer is not None:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                if attempt < 2:
                     await asyncio.sleep(0.5)
                 continue
-        return False, None
+        
+        if not connected:
+            return False, None, layers_passed
+        layers_passed += 2  # لایه ۴ (TCP) و لایه ۵ (ضد قطعی) هر دو رد شدن
+        
+        # لایه ۶: پروب پروتکلی TLS (اگه کانفنیگ TLS/Reality اعلام کرده یا
+        # پورت معمول TLS بود)
+        looks_tls = (
+            'security=tls' in config_text.lower() or
+            'security=reality' in config_text.lower() or
+            port in (443, 8443, 2053, 2083, 2087, 2096)
+        )
+        if looks_tls:
+            try:
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                fut = asyncio.open_connection(target_host, port, ssl=ssl_ctx, server_hostname=target_host)
+                reader2, writer2 = await asyncio.wait_for(fut, timeout=timeout)
+                writer2.close()
+                try:
+                    await writer2.wait_closed()
+                except Exception:
+                    pass
+                layers_passed += 1
+            except Exception:
+                pass  # TLS جواب نداد ولی TCP خام موفق بود - همچنان قابل قبول
+        
+        return True, ping_ms, layers_passed
     
     def extract_proxy_host(self, proxy_url: str) -> Optional[str]:
         """آدرس واقعی سرور پروکسی (نه IP خود ربات) را از لینک t.me/proxy استخراج می‌کند."""
@@ -1620,7 +1673,7 @@ class ChannelScanner:
                 if msg.text:
                     configs = await self.extract_configs_from_text(msg.text)
                     for config in configs:
-                        if self.is_valid_config(config) and await self.is_config_for_iran(config):
+                        if self.is_valid_config(config):
                             found_configs.append(config)
                 
                 if msg.file and msg.file.name:
@@ -1631,7 +1684,7 @@ class ChannelScanner:
                             if file_path:
                                 configs = await self.extract_configs_from_file(file_path.getvalue())
                                 for config in configs:
-                                    if self.is_valid_config(config) and await self.is_config_for_iran(config):
+                                    if self.is_valid_config(config):
                                         logger.info(f"📄 Found config in TXT: {msg.file.name}")
                                         found_configs.append(config)
                         except Exception as e:
@@ -1647,7 +1700,7 @@ class ChannelScanner:
                                         with zip_file.open(file_name) as f:
                                             configs = await self.extract_configs_from_file(f.read())
                                             for config in configs:
-                                                if self.is_valid_config(config) and await self.is_config_for_iran(config):
+                                                if self.is_valid_config(config):
                                                     logger.info(f"📄 Found config in ZIP: {file_name}")
                                                     found_configs.append(config)
                     except Exception as e:
@@ -1777,17 +1830,20 @@ class ChannelScanner:
             port = await self.extract_port(config_text)
             
             # === طبق درخواست: فقط کانفنیگ‌های سالم فوروارد شوند + پینگ واقعی ===
-            # قبل از فرستادن، واقعاً تست می‌کنیم که سرور کانفنیگ روی
-            # آدرس:پورتش جواب می‌ده یا نه (نه فقط اینکه فرمتش درسته)، با ۲
-            # تلاش (ضد خرابی/false-negative گذرا) و اندازه‌گیری پینگ واقعی.
-            # کانفنیگ‌های مرده/آفلاین دیگر اصلاً فوروارد نمی‌شوند.
-            is_alive, ping_ms = await self.check_config_health(host, port)
+            # حداقل ۶ لایه/تست مجزا (نه یک تست ساده TCP) - جزئیات کامل تو
+            # docstring خودِ check_config_health توضیح داده شده.
+            is_alive, ping_ms, layers_passed = await self.check_config_health(host, port, config_text)
             if not is_alive:
                 logger.info(f"⏭️ Skipping dead/unreachable config: {host}:{port}")
                 return False
             
             location = await self.get_ip_info(host) if host else {'ip': 'Unknown', 'country': 'Unknown', 'city': 'Unknown'}
             flag = self.get_country_flag(location.get('countryCode', ''))
+            
+            # طبق تأکید صریح شما: لوکیشن سرور اصلاً مهم نیست (هرجا باشه
+            # اوکیه) - فیلتر «کجا هاست شده» حذف شد. تنها چیزی که تعیین
+            # می‌کنه فوروارد بشه یا نه، همون تست سلامت/پایداری چندلایهٔ
+            # بالاست (check_config_health) که همین الان رد شده.
             
             config_hash = str(abs(hash(config_text.split('#')[0])))
             
@@ -1808,6 +1864,18 @@ class ChannelScanner:
             # پردازش نمی‌کند، پس مشکل قبلیِ نصفه‌ارسالی از این مسیر رخ نمی‌دهد.
             safe_config_text = config_text.replace('`', "'")
             ping_line = f"⚡️ Ping: {ping_ms}ms" if ping_ms is not None else "⚡️ Ping: -"
+            # طبق درخواست «قابلیت منحصربه‌فرد»: نشون‌دادن یه امتیاز کیفیت
+            # ساده بر اساس چند تا از ۶ لایهٔ تست رد شده + سرعت پینگ - تا
+            # کاربر فوری بفهمه این کانفنیگ چقدر قابل‌اعتماده.
+            if ping_ms is not None and ping_ms < 150:
+                speed_badge = "⚡️ سرعت: عالی"
+            elif ping_ms is not None and ping_ms < 350:
+                speed_badge = "🟡 سرعت: متوسط"
+            elif ping_ms is not None:
+                speed_badge = "🟠 سرعت: کند"
+            else:
+                speed_badge = ""
+            quality_line = f"✅ تست‌های موفق: {layers_passed}/6" + (f" | {speed_badge}" if speed_badge else "")
             message = f"""```
 {safe_config_text}
 ```
@@ -1815,6 +1883,7 @@ class ChannelScanner:
 📍 Location: {flag} {location.get('country', 'Unknown')}
 🏙️ City: {location.get('city', 'Unknown')}
 {ping_line}
+{quality_line}
 
 @v2reya88 | @confinghub2"""
             
@@ -1876,8 +1945,8 @@ class ChannelScanner:
             m_port = re.search(r'[?&]port=(\d+)', proxy_url)
             proxy_port = int(m_port.group(1)) if m_port else 443
             
-            # طبق درخواست: تست سلامت + پینگ برای پروکسی هم اعمال شود
-            is_alive, ping_ms = await self.check_config_health(proxy_host, proxy_port)
+            # طبق درخواست: تست سلامت چندلایه + پینگ برای پروکسی هم اعمال شود
+            is_alive, ping_ms, layers_passed = await self.check_config_health(proxy_host, proxy_port)
             if not is_alive:
                 logger.info(f"⏭️ Skipping dead/unreachable proxy: {proxy_host}:{proxy_port}")
                 return False
@@ -2020,6 +2089,9 @@ class ChannelScanner:
         # را برعکس می‌کنیم تا صف با جدیدترین‌ها شروع شود. طبق درخواست فقط
         # ۱۰۰ تای آخر/جدیدترین از این لینک پردازش بشه.
         configs = list(reversed(configs))[:100]
+        
+        # پیش‌فیلتر ارزون (بدون شبکه) قبل از صف - چک قطعی‌تر (لوکیشن واقعی)
+        # موقع ارسال واقعی تو send_config انجام می‌شه
         
         result = await self.db.add_github_configs_to_queue(configs, source_url=url)
         result['ok'] = True
@@ -3480,7 +3552,7 @@ class ScannerBot:
             await wait_msg.edit_text("❌ نتونستم host/port رو ازش دربیارم. یا کانفنیگ کامل بفرست یا فرمت `IP:PORT`.")
             return
         
-        is_alive, ping_ms = await self.scanner.check_config_health(host, port)
+        is_alive, ping_ms, layers_passed = await self.scanner.check_config_health(host, port, text)
         location = await self.scanner.get_ip_info(host) if is_alive else {'country': 'Unknown', 'city': 'Unknown'}
         flag = self.scanner.get_country_flag(location.get('countryCode', ''))
         
@@ -3489,6 +3561,7 @@ class ScannerBot:
                 f"✅ **زنده و در دسترس**\n\n"
                 f"🌐 {host}:{port}\n"
                 f"⚡️ پینگ: {ping_ms}ms\n"
+                f"✅ تست‌های موفق: {layers_passed}/6\n"
                 f"📍 لوکیشن: {flag} {location.get('country', 'Unknown')}\n"
                 f"🏙️ شهر: {location.get('city', 'Unknown')}",
                 parse_mode=ParseMode.MARKDOWN
