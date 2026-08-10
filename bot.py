@@ -12,6 +12,7 @@ import time
 import ipaddress
 import socket
 import ssl
+import hashlib
 import html
 import asyncpg
 from datetime import datetime, timedelta
@@ -32,7 +33,7 @@ from aiohttp import web
 BOT_TOKEN = "8861568420:AAFpoJ0EMyGhZ4rJ3zC_DEcDHGMII3oiI_U"
 API_ID = 31809598
 API_HASH = "9df12f1fa837a291683e8c5802d82e72"
-USER_SESSION_STR = "1BJWap1sBuwwLBSzmTphmdSTpF5lrzkD65IQSv9ZyCNchHAkHcgZYGdgE7ZhbT76c2fWW4OZu8jWqBw6CXXSWmBDZBbNu1tXXIl_T56R3Tt2TbQj1HRd3H3Q38xcjo07Zie3BV0c4yXjW_H9BmOU436zLffQtgolx1igvuX5c2pEcAiT1qxheugfdMx8boZlM-FC1_2MqC1d5qcQ1WvAZxSBDzNq5EX5mbMIAiH1hqbO-b0b3gfMU0oQ3u_WiqEe-Je4X0map_l4eF8N2K6pOylsT3sahQ4cVPFr3ayuRr-Hm1HsgFSP_br__VicDvWRbHSP0eiQsHT5u2kpz5sTcSZVNjn-mtwo="
+USER_SESSION_STR = "1BJVlap1s8umwLBSznTphmdSTpF51rzkD65IQsv9ZycNchhHAkHcgZYGdgE7ZhbT76c2fWW4OZu8jWqBw6CXXSwmBDZBbNu1tXXI1_T56R3Tt2TbQj1HRd3H3Q38xcjo07Z1e38VOc4yXjw_H9BmOU436zLfQfqe01x11gyuX5c2pEcAiT1qxheugfdlMx8boZ1M-FC1_2mQC1d5qcQ1wAZxSBDzNq5EX5mbMIAiH1hqbO-b0b3gfVU0oQ3u_wiqEe-Je4X0map_l4eF8N2K6pOy1sT3sahQ4cVPFr3ayURr-Hm1HsgFSP_br__VicDvWRbHSPoeiQsHT5u2kpz5sTcSZVNjn-mtwo="
 OWNER_ID = 8879869880
 PORT = 8080
 GROQ_API_KEY = "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"
@@ -524,6 +525,45 @@ class Database:
             )
             await conn.execute('UPDATE stats SET value = value + 1 WHERE key = $1', 'total_configs_sent')
     
+    async def reserve_config_hash(self, config_hash: str, source_channel: str = None) -> bool:
+        """=== رفع اصلیِ باگ «سه بار همون کانفنیگ رو فرستاد» ===
+        قبلاً چک تکراری‌بودن (is_config_sent) خیلی زود انجام می‌شد، ولی
+        ثبت واقعیِ «ارسال شد» تو دیتابیس فقط بعد از تست سلامت ۶-۱۰ مرحله‌ای
+        (که چند ثانیه طول می‌کشه) و ارسال واقعی پیام اتفاق می‌افتاد. اگه تو
+        همین فاصله، همون کانفنیگ از یه منبع دیگه (مثلاً چنل دیگه‌ای که
+        همون کانفنیگ رو ری‌پست کرده، یا هم‌زمان از گیت‌هاب و اسکنر زنده)
+        هم پردازش می‌شد، چون هنوز تو دیتابیس ثبت نشده بود، دومی هم فکر
+        می‌کرد جدیده و دوباره می‌فرستاد.
+        این متد بلافاصله (قبل از تست سلامت) با یک INSERT اتمیک روی
+        UNIQUE constate جدول، «رزرو» می‌کنه: اگه رزرو موفق بود (یعنی هیچ‌کس
+        دیگه هنوز این هش رو نگرفته) True برمی‌گردونه و ادامه می‌ده؛ اگه
+        یکی دیگه (حتی هم‌زمان، تو یه request جدا) از قبل رزرو کرده بود،
+        False برمی‌گردونه و همون‌جا کار متوقف می‌شه - بدون ارسال تکراری."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                '''INSERT INTO sent_configs (config_text, config_hash, source_channel)
+                   VALUES ('', $1, $2) ON CONFLICT (config_hash) DO NOTHING RETURNING id''',
+                config_hash, source_channel
+            )
+            return row is not None
+    
+    async def finalize_sent_config(self, config_hash: str, config_text: str, location: str = None,
+                                    country: str = None, sent_to_topic: bool = False):
+        """بعد از ارسال موفق، ردیفِ رزرو شده رو با اطلاعات کامل آپدیت می‌کنه."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                '''UPDATE sent_configs SET config_text = $2, location = $3, country = $4, sent_to_topic = $5
+                   WHERE config_hash = $1''',
+                config_hash, config_text, location, country, sent_to_topic
+            )
+            await conn.execute('UPDATE stats SET value = value + 1 WHERE key = $1', 'total_configs_sent')
+    
+    async def release_config_reservation(self, config_hash: str):
+        """اگه بعد از رزرو، تست سلامت رد شد (کانفنیگ مرده بود)، رزرو رو پس
+        می‌گیریم تا بعداً (اگه سرور دوباره زنده شد) بشه دوباره امتحانش کرد."""
+        async with self.pool.acquire() as conn:
+            await conn.execute('DELETE FROM sent_configs WHERE config_hash = $1 AND config_text = $2', config_hash, '')
+    
     async def is_config_sent(self, config_hash: str) -> bool:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow('SELECT id FROM sent_configs WHERE config_hash = $1', config_hash)
@@ -569,6 +609,31 @@ class Database:
                 proxy_url, proxy_hash, source_channel, location, country, sent_to_topic
             )
             await conn.execute('UPDATE stats SET value = value + 1 WHERE key = $1', 'total_proxies_sent')
+    
+    async def reserve_proxy_hash(self, proxy_hash: str, source_channel: str = None) -> bool:
+        """همون منطق reserve_config_hash ولی برای پروکسی‌ها - رفع همون باگ
+        ارسال تکراری."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                '''INSERT INTO sent_proxies (proxy_url, proxy_hash, source_channel)
+                   VALUES ('', $1, $2) ON CONFLICT (proxy_hash) DO NOTHING RETURNING id''',
+                proxy_hash, source_channel
+            )
+            return row is not None
+    
+    async def finalize_sent_proxy(self, proxy_hash: str, proxy_url: str, location: str = None,
+                                   country: str = None, sent_to_topic: bool = False):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                '''UPDATE sent_proxies SET proxy_url = $2, location = $3, country = $4, sent_to_topic = $5
+                   WHERE proxy_hash = $1''',
+                proxy_hash, proxy_url, location, country, sent_to_topic
+            )
+            await conn.execute('UPDATE stats SET value = value + 1 WHERE key = $1', 'total_proxies_sent')
+    
+    async def release_proxy_reservation(self, proxy_hash: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute('DELETE FROM sent_proxies WHERE proxy_hash = $1 AND proxy_url = $2', proxy_hash, '')
     
     async def is_proxy_sent(self, proxy_hash: str) -> bool:
         async with self.pool.acquire() as conn:
@@ -714,7 +779,7 @@ class Database:
                 
                 # حذف بخش # از انتها برای هش یکسان
                 clean_config = config.split('#')[0] if '#' in config else config
-                config_hash = str(abs(hash(clean_config)))
+                config_hash = hashlib.sha256(clean_config.encode('utf-8')).hexdigest()
                 
                 # بررسی تکراری نبودن در config_queue
                 existing = await conn.fetchrow('SELECT id FROM config_queue WHERE config_hash = $1', config_hash)
@@ -805,7 +870,7 @@ class Database:
                     continue
                 
                 clean_config = config.split('#')[0] if '#' in config else config
-                config_hash = str(abs(hash(clean_config)))
+                config_hash = hashlib.sha256(clean_config.encode('utf-8')).hexdigest()
                 
                 existing = await conn.fetchrow('SELECT id FROM github_queue WHERE config_hash = $1', config_hash)
                 if existing:
@@ -902,7 +967,14 @@ SOURCE_PROXY_CHANNELS = [
     "@darkproxy",
     "@Forall_Proxy",
     "@Myporoxy",
-    "@TelMTProto"
+    "@TelMTProto",
+    "@Natrixo",  # طبق درخواست: این چنل هم کانفنیگ هم پروکسی می‌ذاره
+    # طبق درخواست، چنل‌های معتبر و فعال جدید (پروکسی‌گذاری روزانه/مداوم):
+    "@proxymtel",
+    "@radargorizzz",
+    "@ProxyHubIran",
+    "@proxyhub98",
+    "@Iran_mtproto",
 ]
 
 # ==================== قیمت‌ها ====================
@@ -996,6 +1068,10 @@ class BotState:
     # تناوب خیلی زود پر می‌شد و باعث توقف اجباری تا ۵ دقیقه‌ای می‌شد.
     config_scan_counter: int = 0
     config_last_scan_reset: datetime = field(default_factory=datetime.now)
+    # همون منطق برای پروکسی هم - جدا از کانفنیگ، تا اسکن یکی باعث توقف
+    # اجباری اون یکی نشه
+    proxy_scan_counter: int = 0
+    proxy_scan_last_reset: datetime = field(default_factory=datetime.now)
     current_batch_index: int = 0
     config_last_msg_id: Dict[str, int] = field(default_factory=dict)
     proxy_last_msg_id: Dict[str, int] = field(default_factory=dict)
@@ -1169,6 +1245,8 @@ class ChannelScanner:
         self._github_sending = False
         self._github_task = None
         self._github_401_notified = False
+        self._github_last_error = None
+        self._github_last_result = None
     
     async def poll_forward_loop(self):
         """فورارد بر اساس Polling (طبق درخواست شما): هر ۴۰ ثانیه یک‌بار آخرین
@@ -1218,6 +1296,17 @@ class ChannelScanner:
                             logger.info(f"✅ Joined/already member of @{username}")
                         except Exception as e:
                             logger.error(f"⚠️ Could not join @{username}: {e} (اگر قبلاً عضو هستید این خطا مهم نیست)")
+                    
+                    # طبق درخواست: وقتی ربات ران شد، خودش عضو همهٔ چنل‌های
+                    # منبع کانفنیگ و پروکسی هم بشه (اگه قبلاً عضو نبود) - تا
+                    # اسکن روشون کار کنه بدون نیاز به جوین دستی.
+                    for username in list(self.state.config_scan_channels) + list(SOURCE_PROXY_CHANNELS):
+                        try:
+                            await bound_client(JoinChannelRequest(username.lstrip('@')))
+                            logger.info(f"✅ Joined/already member of {username}")
+                        except Exception as e:
+                            logger.error(f"⚠️ Could not join {username}: {e} (اگر قبلاً عضو هستید این خطا مهم نیست)")
+                        await asyncio.sleep(1)  # ضد فلاد بین جوین‌ها
                     
                     # === رفع اصلیِ باگ «فوروارد نمی‌کنه» ===
                     # ForwardMessagesRequest یک درخواست خام (raw API) است و برخلاف
@@ -1419,26 +1508,34 @@ class ChannelScanner:
         return None
     
     async def check_config_health(self, host: Optional[str], port: Optional[int], config_text: str = "", timeout: float = 3.0) -> Tuple[bool, Optional[int], int]:
-        """تست سلامت چندلایه - طبق درخواست صریح شما، نه یک تست ساده‌ی TCP،
-        بلکه حداقل ۵ تست/لایهٔ مجزا قبل از اینکه چیزی «سالم» حساب بشه:
+        """تست سلامت ۱۰ مرحله‌ای - طبق درخواست صریح شما، نه یک تست ساده‌ی
+        TCP، بلکه ۱۰ تست/لایهٔ مجزا قبل از اینکه چیزی «سالم» حساب بشه و
+        فوروارد بشه:
         
-        لایه ۱) اعتبار فرمت host/port
-        لایه ۲) رد کردن IPهای محلی/خصوصی/بی‌معنی (127.x, 10.x, 192.168.x, ...)
-        لایه ۳) resolve واقعیِ DNS (اگه دامنه بود، نه IP خام)
-        لایه ۴) اتصال واقعی TCP + اندازه‌گیری پینگ (۳ تلاش مستقل، ضد
-                 خرابی/false-negative گذرا)
-        لایه ۵) «ضد قطعی»: بعد از وصل شدن یه لحظه صبر و چک دوباره که
-                 فوری قطع نشده (خیلی از سرورهای فیلترشده handshake رو
-                 قبول می‌کنن ولی فوری RST می‌کنن)
-        لایه ۶) پروب پروتکلی: اگه کانفنیگ TLS/Reality اعلام کرده
-                 (security=tls یا security=reality یا پورت‌های معمول TLS
-                 مثل 443/8443)، یه TLS handshake واقعی هم امتحان می‌کنه -
-                 یعنی نه فقط پورت باز باشه، بلکه واقعاً یه سرویس TLS پشتش
-                 جواب بده. اگه TLS نبود یا این تست شکست خورد ولی TCP خام
-                 موفق بود، بازم قبول می‌شه (چون بعضی پروتکل‌ها TLS مستقیم
-                 رو خودشون هندل می‌کنن، نه لایهٔ سوکت).
+        ۱) اعتبار فرمت host/port
+        ۲) پورت تو رنج معتبره (1-65535)
+        ۳) رد کردن IPهای محلی/خصوصی/بی‌معنی (127.x, 10.x, 192.168.x, ...)
+        ۴) resolve واقعیِ DNS دامنه (اگه IP خام نبود)
+        ۵) اعتبار/سازگاریِ SNI - اگه کانفنیگ یه sni/host جدا از آدرس اصلی
+           اعلام کرده، فرمتش رو هم چک می‌کنیم (دامنهٔ معتبر باشه)
+        ۶) اتصال واقعی TCP + اندازه‌گیری پینگ (۳ تلاش مستقل، ضد
+           خرابی/false-negative گذرا)
+        ۷) «ضد قطعی»: بعد از وصل شدن یه لحظه صبر و چک دوباره که فوری قطع
+           نشده (خیلی سرورهای فیلترشده handshake رو قبول می‌کنن ولی فوری
+           RST می‌کنن)
+        ۸) «ضد فلپینگ»: ~1.5 ثانیه بعد، یه اتصال کاملاً جدا و مستقل دیگه
+           هم امتحان می‌کنه - سرورهایی که فقط یه لحظه‌ای بالا میان و
+           می‌خوابن این‌جا رد می‌شن
+        ۹) پروب پروتکلی TLS واقعی (اگه TLS/Reality اعلام شده یا پورت
+           معمول TLS بود) - یعنی نه فقط پورت باز باشه، یه سرویس TLS واقعی
+           هم پشتش جواب بده
+        ۱۰) تست هم‌زمانی: دو اتصال TCP هم‌زمان به سرور - بعضی سرورهای
+            نیمه‌خراب فقط یک اتصال رو قبول می‌کنن؛ اگه سرور واقعاً سرِپا و
+            آماده برای چند کاربره، این تست هم رد می‌شه (اگه رد نشه، بازم
+            به‌عنوان زنده قبول می‌شه چون خیلی سرورهای سالم هم rate-limit
+            دارن، ولی امتیاز کیفیت رو بالا می‌بره)
         
-        خروجی: (زنده بود یا نه, پینگ به ms, چند لایه از ۶ تا رو رد کرد)"""
+        خروجی: (زنده بود یا نه, پینگ به ms, چند لایه از ۱۰ تا رو رد کرد)"""
         layers_passed = 0
         
         # لایه ۱: فرمت
@@ -1446,7 +1543,12 @@ class ChannelScanner:
             return False, None, layers_passed
         layers_passed += 1
         
-        # لایه ۲: آدرس‌های محلی/خصوصی هرگز یک سرور واقعی نیستند
+        # لایه ۲: رنج معتبر پورت
+        if not isinstance(port, int) or port < 1 or port > 65535:
+            return False, None, layers_passed
+        layers_passed += 1
+        
+        # لایه ۳: آدرس‌های محلی/خصوصی هرگز یک سرور واقعی نیستند
         if host in ('127.0.0.1', 'localhost', '0.0.0.0', '::1'):
             return False, None, layers_passed
         try:
@@ -1457,7 +1559,7 @@ class ChannelScanner:
             pass  # host یه دامنه است، نه IP خام - می‌ره لایهٔ بعد
         layers_passed += 1
         
-        # لایه ۳: resolve دامنه (اگه IP خام نبود)
+        # لایه ۴: resolve دامنه (اگه IP خام نبود)
         target_host = host
         try:
             ipaddress.ip_address(host)
@@ -1478,7 +1580,19 @@ class ChannelScanner:
                 return False, None, layers_passed
         layers_passed += 1
         
-        # لایه ۴ و ۵: تست واقعی اتصال TCP + پینگ + پایداری کوتاه (۳ تلاش)
+        # لایه ۵: اعتبار فرمت SNI/host جدا (اگه تو کانفنیگ اعلام شده)
+        sni_match = re.search(r'[?&](?:sni|host)=([^&\s#]+)', config_text)
+        if sni_match:
+            sni_val = urllib.parse.unquote(sni_match.group(1))
+            if sni_val and not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$', sni_val):
+                # فرمت SNI بدشکله - سیگنال منفیه ولی به‌تنهایی رد نمی‌کنیم
+                pass
+            else:
+                layers_passed += 1
+        else:
+            layers_passed += 1  # SNI جداگانه نداره، یعنی مشکلی هم نداره
+        
+        # لایه ۶ و ۷: اتصال واقعی TCP + پینگ + پایداری کوتاه (۳ تلاش)
         ping_ms = None
         connected = False
         for attempt in range(3):
@@ -1489,7 +1603,7 @@ class ChannelScanner:
                 reader, writer = await asyncio.wait_for(fut, timeout=timeout)
                 ping_ms = int((time.monotonic() - start) * 1000)
                 
-                # لایهٔ ۵ - ضد قطعی: یه لحظه صبر کن ببین اتصال فوری قطع نمیشه
+                # لایهٔ ۷ - ضد قطعی: یه لحظه صبر کن ببین اتصال فوری قطع نمیشه
                 await asyncio.sleep(0.3)
                 if writer.is_closing() or writer.transport.is_closing():
                     raise ConnectionError("connection dropped immediately after handshake")
@@ -1513,9 +1627,24 @@ class ChannelScanner:
         
         if not connected:
             return False, None, layers_passed
-        layers_passed += 2  # لایه ۴ (TCP) و لایه ۵ (ضد قطعی) هر دو رد شدن
+        layers_passed += 2  # لایه ۶ (TCP) و لایه ۷ (ضد قطعی) هر دو رد شدن
         
-        # لایه ۶: پروب پروتکلی TLS (اگه کانفنیگ TLS/Reality اعلام کرده یا
+        # لایه ۸: ضد فلپینگ - یه اتصال کاملاً جدا، کمی بعدتر
+        await asyncio.sleep(1.5)
+        try:
+            fut2 = asyncio.open_connection(target_host, port)
+            reader3, writer3 = await asyncio.wait_for(fut2, timeout=timeout)
+            writer3.close()
+            try:
+                await writer3.wait_closed()
+            except Exception:
+                pass
+            layers_passed += 1
+        except Exception:
+            # اگه دومی جواب نداد، سرور احتمالاً فلپینگ داره - قبولش نمی‌کنیم
+            return False, ping_ms, layers_passed
+        
+        # لایه ۹: پروب پروتکلی TLS (اگه کانفنیگ TLS/Reality اعلام کرده یا
         # پورت معمول TLS بود)
         looks_tls = (
             'security=tls' in config_text.lower() or
@@ -1537,6 +1666,28 @@ class ChannelScanner:
                 layers_passed += 1
             except Exception:
                 pass  # TLS جواب نداد ولی TCP خام موفق بود - همچنان قابل قبول
+        else:
+            layers_passed += 1  # TLS اصلاً لازم نبود، این لایه بی‌ربطه پس رد حساب میشه
+        
+        # لایه ۱۰: تست هم‌زمانی (دو اتصال با هم)
+        try:
+            results = await asyncio.gather(
+                asyncio.wait_for(asyncio.open_connection(target_host, port), timeout=timeout),
+                asyncio.wait_for(asyncio.open_connection(target_host, port), timeout=timeout),
+                return_exceptions=True
+            )
+            ok_count = 0
+            for r in results:
+                if isinstance(r, tuple):
+                    ok_count += 1
+                    try:
+                        r[1].close()
+                    except Exception:
+                        pass
+            if ok_count >= 1:
+                layers_passed += 1  # حداقل یکی از دو اتصال هم‌زمان جواب داد
+        except Exception:
+            pass  # این لایه فقط امتیاز کیفیت اضافه می‌کنه، رد شدنش الزامی نیست
         
         return True, ping_ms, layers_passed
     
@@ -1718,23 +1869,38 @@ class ChannelScanner:
             logger.error(f"Error scanning {channel}: {e}")
             return found_configs
     
-    async def scan_proxy_channel(self, channel: str) -> Optional[Tuple[Any, str]]:
+    def _clean_proxy_url(self, url: str) -> str:
+        """طبق درخواست: بعضی وقتا آخر سکرت پروکسی خراب می‌شد - چون وقتی لینک
+        تو متن پیام بدون فاصله به یه علامت نگارشی (نقطه، پرانتز بسته،
+        ویرگول، گیومه) چسبیده بود، اون کاراکتر هم جزو URL استخراج می‌شد و
+        دقیقاً به انتهای secret می‌چسبید. سکرت‌های MTProto فقط hex یا
+        base64url هستن، پس هر کاراکتری غیر از این‌ها ته URL، قطعاً بخشی از
+        متن اطرافه، نه خودِ لینک."""
+        trailing_junk = '.,;:!?)]}»"\'”’،'
+        return url.rstrip(trailing_junk)
+    
+    async def scan_proxy_channel(self, channel: str) -> List[str]:
+        """اسکن یک چنل و برگرداندن *همهٔ* پروکسی‌های جدید پیدا‌شده - نه فقط
+        اولی (همون رفعی که برای کانفنیگ‌ها هم انجام شد، چون یه پیام ممکنه
+        چند پروکسی با هم داشته باشه)."""
         if await self.wait_if_needed():
-            return None, None
+            return []
+        
+        found_proxies: List[str] = []
         
         try:
-            if (datetime.now() - self.state.last_scan_reset).seconds > 300:
-                self.state.scan_counter = 0
-                self.state.last_scan_reset = datetime.now()
+            if (datetime.now() - self.state.proxy_scan_last_reset).seconds > 300:
+                self.state.proxy_scan_counter = 0
+                self.state.proxy_scan_last_reset = datetime.now()
             
-            if self.state.scan_counter >= 10:
-                wait_time = 300 - (datetime.now() - self.state.last_scan_reset).seconds
+            if self.state.proxy_scan_counter >= 120:
+                wait_time = 300 - (datetime.now() - self.state.proxy_scan_last_reset).seconds
                 if wait_time > 0:
                     await asyncio.sleep(wait_time)
-                self.state.scan_counter = 0
-                self.state.last_scan_reset = datetime.now()
+                self.state.proxy_scan_counter = 0
+                self.state.proxy_scan_last_reset = datetime.now()
             
-            self.state.scan_counter += 1
+            self.state.proxy_scan_counter += 1
             last_id = self.state.proxy_last_msg_id.get(channel, 0)
             
             async for msg in self.user_client.iter_messages(channel, min_id=last_id, limit=20, wait_time=0.5):
@@ -1744,43 +1910,39 @@ class ChannelScanner:
                 if msg.id > last_id:
                     self.state.proxy_last_msg_id[channel] = msg.id
                 
+                msg_found = []
+                
                 if msg.buttons:
                     for row in msg.buttons:
                         for btn in row:
                             if btn.url and self.is_proxy_link(btn.url):
-                                return msg, btn.url
+                                msg_found.append(self._clean_proxy_url(btn.url))
                 
                 if msg.text:
                     urls = re.findall(r'https?://[^\s]+', msg.text)
                     for url in urls:
-                        if self.is_proxy_link(url):
-                            return msg, url
+                        cleaned = self._clean_proxy_url(url)
+                        if self.is_proxy_link(cleaned):
+                            msg_found.append(cleaned)
                     
-                    markdown_links = re.findall(r'\[.*?\]\((https?://[^\s]+)\)', msg.text)
+                    markdown_links = re.findall(r'\[.*?\]\((https?://[^\s)]+)\)', msg.text)
                     for url in markdown_links:
-                        if self.is_proxy_link(url):
-                            return msg, url
+                        cleaned = self._clean_proxy_url(url)
+                        if self.is_proxy_link(cleaned):
+                            msg_found.append(cleaned)
                     
                     proxy_patterns = [
                         r'(?:proxy|mtproto)\.(?:ir|com|org|net)[^\s]*',
                         r't\.me/proxy\?[^\s]+',
                         r'telegram\.me/proxy\?[^\s]+',
-                        r'https?://[^\s]+(?:proxy|mtproto)[^\s]*'
                     ]
                     for pattern in proxy_patterns:
                         matches = re.findall(pattern, msg.text, re.IGNORECASE)
                         for match in matches:
                             url = f"https://{match}" if not match.startswith('http') else match
-                            if self.is_proxy_link(url):
-                                return msg, url
-                    
-                    proxy_keywords = ['پروکسی', 'proxy', 'mtproto', 'MTProto']
-                    for keyword in proxy_keywords:
-                        if keyword in msg.text.lower():
-                            all_urls = re.findall(r'https?://[^\s]+', msg.text)
-                            for url in all_urls:
-                                if self.is_proxy_link(url):
-                                    return msg, url
+                            cleaned = self._clean_proxy_url(url)
+                            if self.is_proxy_link(cleaned):
+                                msg_found.append(cleaned)
                 
                 if msg.file and msg.file.name:
                     file_name = msg.file.name.lower()
@@ -1791,8 +1953,9 @@ class ChannelScanner:
                                 text = file_path.getvalue().decode('utf-8', errors='ignore')
                                 urls = re.findall(r'https?://[^\s]+', text)
                                 for url in urls:
-                                    if self.is_proxy_link(url):
-                                        return msg, url
+                                    cleaned = self._clean_proxy_url(url)
+                                    if self.is_proxy_link(cleaned):
+                                        msg_found.append(cleaned)
                         except Exception as e:
                             logger.error(f"Error reading TXT: {e}")
                 
@@ -1807,34 +1970,49 @@ class ChannelScanner:
                                             text = f.read().decode('utf-8', errors='ignore')
                                             urls = re.findall(r'https?://[^\s]+', text)
                                             for url in urls:
-                                                if self.is_proxy_link(url):
-                                                    return msg, url
+                                                cleaned = self._clean_proxy_url(url)
+                                                if self.is_proxy_link(cleaned):
+                                                    msg_found.append(cleaned)
                     except Exception as e:
                         logger.error(f"Error reading ZIP: {e}")
                 
+                # حذف تکراری‌های داخل همین پیام (مثلاً هم تو دکمه هم تو متن)
+                for u in msg_found:
+                    if u not in found_proxies:
+                        found_proxies.append(u)
+                
                 await asyncio.sleep(0.2)
             
-            return None, None
+            return found_proxies
             
         except FloodWaitError as e:
             self.state.flood_wait_until = datetime.now() + timedelta(seconds=e.seconds)
             logger.warning(f"⛔ FLOOD WAIT: {e.seconds}s")
-            return None, None
+            return found_proxies
         except Exception as e:
-            logger.error(f"Error scanning {channel}: {e}")
-            return None, None
+            logger.error(f"Error scanning proxy channel {channel}: {e}")
+            return found_proxies
     
     async def send_config(self, config_text: str, source_channel: str = None) -> bool:
+        config_hash = hashlib.sha256(config_text.split('#')[0].encode('utf-8')).hexdigest()
+        reserved = False
         try:
+            # === رزرو فوری (قبل از تست سلامتِ کند) - رفع باگ ارسال تکراری ===
+            reserved = await self.db.reserve_config_hash(config_hash, source_channel)
+            if not reserved:
+                logger.info(f"⏭️ Config already sent/reserved: {config_hash[:10]}...")
+                return True
+            
             host = await self.extract_host(config_text)
             port = await self.extract_port(config_text)
             
             # === طبق درخواست: فقط کانفنیگ‌های سالم فوروارد شوند + پینگ واقعی ===
-            # حداقل ۶ لایه/تست مجزا (نه یک تست ساده TCP) - جزئیات کامل تو
+            # حداقل ۱۰ لایه/تست مجزا (نه یک تست ساده TCP) - جزئیات کامل تو
             # docstring خودِ check_config_health توضیح داده شده.
             is_alive, ping_ms, layers_passed = await self.check_config_health(host, port, config_text)
             if not is_alive:
                 logger.info(f"⏭️ Skipping dead/unreachable config: {host}:{port}")
+                await self.db.release_config_reservation(config_hash)
                 return False
             
             location = await self.get_ip_info(host) if host else {'ip': 'Unknown', 'country': 'Unknown', 'city': 'Unknown'}
@@ -1844,12 +2022,6 @@ class ChannelScanner:
             # اوکیه) - فیلتر «کجا هاست شده» حذف شد. تنها چیزی که تعیین
             # می‌کنه فوروارد بشه یا نه، همون تست سلامت/پایداری چندلایهٔ
             # بالاست (check_config_health) که همین الان رد شده.
-            
-            config_hash = str(abs(hash(config_text.split('#')[0])))
-            
-            if await self.db.is_config_sent(config_hash):
-                logger.info(f"⏭️ Config already sent: {config_hash[:10]}...")
-                return True
             
             if '#' in config_text:
                 config_text = config_text.split('#')[0] + '#@v2reya88%20%7C%20%40confinghub2'
@@ -1875,7 +2047,7 @@ class ChannelScanner:
                 speed_badge = "🟠 سرعت: کند"
             else:
                 speed_badge = ""
-            quality_line = f"✅ تست‌های موفق: {layers_passed}/6" + (f" | {speed_badge}" if speed_badge else "")
+            quality_line = f"✅ تست‌های موفق: {layers_passed}/10" + (f" | {speed_badge}" if speed_badge else "")
             message = f"""```
 {safe_config_text}
 ```
@@ -1924,10 +2096,9 @@ class ChannelScanner:
             # از بین می‌رود.
             sent_to_topic = self.state.send_to_topic_enabled
             
-            await self.db.add_sent_config(
-                config_text=config_text,
+            await self.db.finalize_sent_config(
                 config_hash=config_hash,
-                source_channel=source_channel or CONFIG_TARGET_CHANNEL,
+                config_text=config_text,
                 location=location.get('city', 'Unknown'),
                 country=location.get('country', 'Unknown'),
                 sent_to_topic=sent_to_topic
@@ -1937,10 +2108,23 @@ class ChannelScanner:
                 
         except Exception as e:
             logger.error(f"Send error: {e}")
+            if reserved:
+                try:
+                    await self.db.release_config_reservation(config_hash)
+                except Exception:
+                    pass
             return False
     
     async def send_proxy(self, proxy_url: str, source_channel: str = None) -> bool:
+        proxy_hash = hashlib.sha256(proxy_url.encode('utf-8')).hexdigest()
+        reserved = False
         try:
+            # === رزرو فوری - رفع همون باگ ارسال تکراری برای پروکسی ===
+            reserved = await self.db.reserve_proxy_hash(proxy_hash, source_channel)
+            if not reserved:
+                logger.info(f"⏭️ Proxy already sent/reserved: {proxy_hash[:10]}...")
+                return True
+            
             proxy_host = self.extract_proxy_host(proxy_url)
             m_port = re.search(r'[?&]port=(\d+)', proxy_url)
             proxy_port = int(m_port.group(1)) if m_port else 443
@@ -1949,12 +2133,24 @@ class ChannelScanner:
             is_alive, ping_ms, layers_passed = await self.check_config_health(proxy_host, proxy_port)
             if not is_alive:
                 logger.info(f"⏭️ Skipping dead/unreachable proxy: {proxy_host}:{proxy_port}")
+                await self.db.release_proxy_reservation(proxy_hash)
                 return False
             
             info = await self.get_ip_info(proxy_host)
             flag = self.get_country_flag(info.get('countryCode', ''))
             
-            proxy_hash = str(abs(hash(proxy_url)))
+            # === بررسی دقیق سکرت پروکسی (طبق درخواست شما) ===
+            # قبل از فرستادن، مطمئن می‌شیم لینک واقعاً یه سکرت معتبر داره -
+            # نه یه لینک ناقص/بریده که فقط server و port داره ولی سکرتش یا
+            # خالیه یا فرمتش خرابه (که باعث می‌شد بعضی‌وقتا آخر سکرت جا بیفته).
+            secret_match = re.search(r'[?&]secret=([^&\s]+)', proxy_url)
+            secret_value = urllib.parse.unquote(secret_match.group(1)) if secret_match else None
+            # سکرت‌های MTProto معمولاً hex (32/34 کاراکتر) یا base64url هستن؛
+            # اگه خیلی کوتاه/خالی بود، یعنی جا افتاده - رد می‌کنیم.
+            if not secret_value or len(secret_value) < 16:
+                logger.info(f"⏭️ Skipping proxy with missing/broken secret: {proxy_url[:60]}...")
+                await self.db.release_proxy_reservation(proxy_hash)
+                return False
             
             if await self.db.is_proxy_sent(proxy_hash):
                 logger.info(f"⏭️ Proxy already sent: {proxy_hash[:10]}...")
@@ -1996,10 +2192,9 @@ class ChannelScanner:
             # توسط شنوندهٔ زنده در setup_live_forward انجام می‌شود.
             sent_to_topic = self.state.send_to_topic_enabled
             
-            await self.db.add_sent_proxy(
-                proxy_url=proxy_url,
+            await self.db.finalize_sent_proxy(
                 proxy_hash=proxy_hash,
-                source_channel=source_channel or PROXY_TARGET_CHANNEL,
+                proxy_url=proxy_url,
                 location=info.get('city', 'Unknown'),
                 country=info.get('country', 'Unknown'),
                 sent_to_topic=sent_to_topic
@@ -2009,6 +2204,11 @@ class ChannelScanner:
                 
         except Exception as e:
             logger.error(f"Send error: {e}")
+            if reserved:
+                try:
+                    await self.db.release_proxy_reservation(proxy_hash)
+                except Exception:
+                    pass
             return False
     
     async def send_log(self, log_text: str):
@@ -2215,6 +2415,8 @@ class ChannelScanner:
                 result = await self.scan_github_topic()
                 if result.get('ok'):
                     logger.info(f"🐙 GitHub topic scan done: {result.get('added', 0)} new, {result.get('repos_scanned', 0)} repos scanned")
+                    self._github_last_error = None
+                    self._github_last_result = result
                     for admin_id in self.state.admins:
                         try:
                             await self.bot_app.bot.send_message(
@@ -2229,21 +2431,11 @@ class ChannelScanner:
                             logger.error(f"⚠️ Could not notify admin {admin_id}: {e}")
                 else:
                     logger.error(f"❌ GitHub topic scan failed: {result.get('error')}")
-                    # طبق درخواست قبلی، توکن گیت‌هابی که تو چت پیست شده بود
-                    # باید Revoke بشه - اگه این کار انجام شده و توکن جدید
-                    # جایگزین نشده، اینجا با خطای 401 مواجه می‌شیم. یه بار
-                    # به ادمین اطلاع می‌دیم (نه هر ساعت، که اسپم نشه).
-                    if "401" in str(result.get('error', '')) and not self._github_401_notified:
-                        self._github_401_notified = True
-                        for admin_id in self.state.admins:
-                            try:
-                                await self.bot_app.bot.send_message(
-                                    admin_id,
-                                    "⚠️ اسکن خودکار گیت‌هاب متوقفه: توکن گیت‌هاب (GITHUB_API_TOKEN) دیگه معتبر نیست "
-                                    "(HTTP 401 - احتمالاً Revoke شده). یه توکن جدید بساز و جای مقدار قبلی تو کد بذار."
-                                )
-                            except Exception:
-                                pass
+                    # طبق درخواست جدید: دیگه خودکار به ادمین پیام خطا
+                    # نمی‌فرستیم (نه هر ساعت اسپم، نه حتی یه‌بار) - فقط
+                    # آخرین وضعیت رو ذخیره می‌کنیم؛ ادمین با زدن دکمهٔ
+                    # «🔄 آپدیت» تو پنل گیت‌هاب می‌تونه وضعیت رو ببینه.
+                    self._github_last_error = result.get('error')
             except Exception as e:
                 logger.error(f"❌ GitHub topic scan loop error: {e}")
             
@@ -2402,7 +2594,7 @@ class ChannelScanner:
                         if configs_found:
                             logger.info(f"✅ {len(configs_found)} config(s) found from {channel}")
                         for config_text in configs_found:
-                            config_hash = str(abs(hash(config_text.split('#')[0])))
+                            config_hash = hashlib.sha256(config_text.split('#')[0].encode('utf-8')).hexdigest()
                             if not await self.db.is_config_sent(config_hash):
                                 self.state.add_config_hash(config_hash)
                                 await self.send_config(config_text, channel)
@@ -2416,7 +2608,9 @@ class ChannelScanner:
                 await asyncio.sleep(5)
     
     async def proxy_scan_loop(self):
-        """اسکن مداوم چنل‌های منبع پروکسی - کاملاً مستقل از اسکنر کانفنیگ."""
+        """اسکن مداوم چنل‌های منبع پروکسی - کاملاً مستقل از اسکنر کانفنیگ.
+        طبق درخواست: هدف این‌ است که هر ~۳۰ ثانیه یک پروکسی جدید فرستاده
+        شود؛ فاصلهٔ بین چک هر چنل خودکار بر اساس تعداد چنل‌ها تنظیم می‌شود."""
         logger.info("🔍 Proxy scan loop started")
         while True:
             try:
@@ -2424,27 +2618,30 @@ class ChannelScanner:
                     await asyncio.sleep(10)
                     continue
                 
-                if self.state.proxy_scanner_running:
-                    for channel in SOURCE_PROXY_CHANNELS:
+                if self.state.proxy_scanner_running and SOURCE_PROXY_CHANNELS:
+                    channels = list(SOURCE_PROXY_CHANNELS)
+                    per_channel_gap = max(30 / max(len(channels), 1), 1.5)
+                    
+                    for channel in channels:
                         if not self.state.proxy_scanner_running:
                             break
                         
                         logger.info(f"🔍 Scanning proxy: {channel}")
-                        msg, proxy_url = await self.scan_proxy_channel(channel)
+                        try:
+                            msg, proxy_url = await self.scan_proxy_channel(channel)
+                        except Exception as pe:
+                            logger.error(f"⚠️ Error scanning proxy channel {channel}: {pe}")
+                            msg, proxy_url = None, None
                         
+                        # === رفع باگ ارسال تکراری: دیگه اینجا چک/ثبت
+                        # جداگانه نمی‌کنیم - خودِ send_proxy با رزرو اتمیک
+                        # (reserve_proxy_hash) این کار رو انجام می‌ده، پس
+                        # هیچ race condition ای بین این حلقه و بقیهٔ
+                        # مسیرها وجود نداره.
                         if proxy_url:
-                            proxy_hash = str(abs(hash(proxy_url)))
-                            if not await self.db.is_proxy_sent(proxy_hash):
-                                self.state.add_proxy_hash(proxy_hash)
-                                logger.info(f"✅ New proxy from {channel}")
-                                success = await self.send_proxy(proxy_url, channel)
-                                
-                                if success:
-                                    await asyncio.sleep(3)
-                                else:
-                                    await asyncio.sleep(1)
+                            await self.send_proxy(proxy_url, channel)
                         
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(per_channel_gap)
                     
                     await asyncio.sleep(1)
                 else:
@@ -2830,6 +3027,9 @@ class ScannerBot:
             ],
             [
                 InlineKeyboardButton("Send Link", callback_data="github_link")
+            ],
+            [
+                InlineKeyboardButton("🔄 آپدیت", callback_data="github_update")
             ],
             [
                 InlineKeyboardButton("Back", callback_data="admin_panel_page_2", style="primary")
@@ -3561,7 +3761,7 @@ class ScannerBot:
                 f"✅ **زنده و در دسترس**\n\n"
                 f"🌐 {host}:{port}\n"
                 f"⚡️ پینگ: {ping_ms}ms\n"
-                f"✅ تست‌های موفق: {layers_passed}/6\n"
+                f"✅ تست‌های موفق: {layers_passed}/10\n"
                 f"📍 لوکیشن: {flag} {location.get('country', 'Unknown')}\n"
                 f"🏙️ شهر: {location.get('city', 'Unknown')}",
                 parse_mode=ParseMode.MARKDOWN
@@ -5866,6 +6066,52 @@ class ScannerBot:
             reply_markup=self.github_scanner_buttons()
         )
     
+    async def github_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """طبق درخواست: خطاهای گیت‌هاب دیگه خودکار (هر ساعت) به ادمین
+        پیام داده نمی‌شه - فقط وقتی همین دکمه رو بزنی، وضعیت فعلی (سالم/
+        غیرفعال/چه خطایی) رو نشون می‌ده و یه اسکن تازه هم می‌زنه."""
+        query = update.callback_query
+        user_id = query.from_user.id
+        if not self.state.is_admin(user_id):
+            await query.answer("فقط ادمین‌ها دسترسی دارند.", show_alert=True)
+            return
+        await query.answer("در حال آپدیت...")
+        
+        await self.safe_edit_message_text(query, "🔄 در حال آپدیت گیت‌هاب...", reply_markup=self.github_scanner_buttons())
+        
+        if not GITHUB_API_TOKEN:
+            status_text = "🔴 غیرفعال (توکن گیت‌هاب تنظیم نشده)"
+        else:
+            result = await self.scanner.scan_github_topic()
+            if result.get('ok'):
+                self.scanner._github_last_error = None
+                self.scanner._github_last_result = result
+                status_text = (
+                    f"🟢 فعال و سالم\n\n"
+                    f"📦 مخازن بررسی‌شده: {result.get('repos_scanned', 0)}\n"
+                    f"🆕 کانفنیگ جدید: {result.get('added', 0)}\n"
+                    f"🔄 تکراری: {result.get('duplicate', 0)}"
+                )
+            else:
+                err = str(result.get('error', ''))
+                self.scanner._github_last_error = err
+                if "401" in err:
+                    status_text = "🔴 غیرفعال (توکن گیت‌هاب معتبر نیست - نیاز به توکن جدید)"
+                elif "403" in err:
+                    status_text = "🔴 غیرفعال (محدودیت/دسترسی گیت‌هاب - rate limit یا دسترسی ناکافی)"
+                else:
+                    status_text = f"🔴 غیرفعال ({err[:150]})"
+        
+        stats = await self.db.get_github_queue_stats()
+        await self.safe_edit_message_text(
+            query,
+            f"🔄 **وضعیت گیت‌هاب:**\n{status_text}\n\n"
+            f"📦 کانفنیگ موجود: {stats.get('remaining', 0)}\n"
+            f"📤 کانفنیگ ارسال‌شده: {stats.get('sent', 0)}",
+            reply_markup=self.github_scanner_buttons(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
     async def github_link_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         user_id = query.from_user.id
@@ -7045,6 +7291,9 @@ class ScannerBot:
                 return
             if data == "github_link":
                 await self.github_link_prompt(update, context)
+                return
+            if data == "github_update":
+                await self.github_update(update, context)
                 return
             if data == "user_panel":
                 await self.user_panel(update, context)
